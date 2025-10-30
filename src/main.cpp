@@ -70,6 +70,11 @@ namespace
   bool g_awsConnected = false;
   uint32_t g_lastAwsAttempt = 0;
   bool g_claimPending = false;
+  bool g_awsCredentialsLoaded = false;
+  bool g_spiffsReady = false;
+  String g_rootCaPem;
+  String g_deviceCertPem;
+  String g_privateKeyPem;
 
   // ========================== LOGGING
   void logWithDeviceId(const char *fmt, ...)
@@ -88,11 +93,28 @@ namespace
 
   // ========================== AWS HELPERS
 
+  void clearAwsCredentials()
+  {
+    g_rootCaPem = "";
+    g_deviceCertPem = "";
+    g_privateKeyPem = "";
+    g_awsCredentialsLoaded = false;
+    g_awsConnected = false;
+  }
+
   bool setupAWS()
   {
+    if (!g_spiffsReady)
+    {
+      Serial.println("[AWS] ❌ SPIFFS no montado");
+      clearAwsCredentials();
+      return false;
+    }
+
     if (!SPIFFS.exists(ROOT_CA_PATH) || !SPIFFS.exists(CERT_PATH) || !SPIFFS.exists(KEY_PATH))
     {
       Serial.println("[AWS] ❌ Certificados no encontrados en SPIFFS");
+      clearAwsCredentials();
       return false;
     }
 
@@ -103,29 +125,47 @@ namespace
     if (!ca || !cert || !key)
     {
       Serial.println("[AWS] ❌ No se pudieron abrir los certificados");
+      if (ca) ca.close();
+      if (cert) cert.close();
+      if (key) key.close();
+      clearAwsCredentials();
       return false;
     }
 
-    String rootCA = ca.readString();
-    String deviceCert = cert.readString();
-    String privateKey = key.readString();
+    g_rootCaPem = ca.readString();
+    g_deviceCertPem = cert.readString();
+    g_privateKeyPem = key.readString();
 
     ca.close();
     cert.close();
     key.close();
 
-    net.setCACert(rootCA.c_str());
-    net.setCertificate(deviceCert.c_str());
-    net.setPrivateKey(privateKey.c_str());
+    if (g_rootCaPem.length() == 0 || g_deviceCertPem.length() == 0 || g_privateKeyPem.length() == 0)
+    {
+      Serial.println("[AWS] ❌ Certificados vacios o corruptos");
+      clearAwsCredentials();
+      return false;
+    }
+
+    net.setCACert(g_rootCaPem.c_str());
+    net.setCertificate(g_deviceCertPem.c_str());
+    net.setPrivateKey(g_privateKeyPem.c_str());
 
     mqttClient.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
     mqttClient.setBufferSize(1024);
+    g_awsCredentialsLoaded = true;
     logWithDeviceId("[AWS] Configuracion MQTT lista\n");
     return true;
   }
 
   bool connectAWS()
   {
+    if (!g_awsCredentialsLoaded)
+    {
+      g_awsConnected = false;
+      return false;
+    }
+
     if (mqttClient.connected()) return true;
 
     if (millis() - g_lastAwsAttempt < kAwsReconnectDelayMs) return false;
@@ -179,6 +219,12 @@ namespace
   void handleAWS()
   {
     if (!g_wifiConnected)
+    {
+      g_awsConnected = false;
+      return;
+    }
+
+    if (!g_awsCredentialsLoaded)
     {
       g_awsConnected = false;
       return;
@@ -499,8 +545,10 @@ namespace
           logWithDeviceId("[WIFI] IP: %s\n", ip.c_str());
         }
         Provisioning::notifyStatus("wifi:conectado");
-        setupAWS();     
-        connectAWS();   // 👈 Se conecta a AWS inmediatamente
+        if (setupAWS())
+        {
+          connectAWS();   // 👈 Se conecta a AWS inmediatamente
+        }
         g_claimPending = true;
         stopBleSession();
       }
@@ -545,13 +593,23 @@ void setup()
 {
   Serial.begin(115200);
 
-  if (!SPIFFS.begin(true))
+  g_spiffsReady = SPIFFS.begin(false);
+  if (g_spiffsReady)
   {
-    Serial.println("[SPIFFS] ❌ Error al iniciar");
+    Serial.println("[SPIFFS] OK: montado correctamente");
   }
   else
   {
-    Serial.println("[SPIFFS] ✅ SPIFFS montado correctamente");
+    Serial.println("[SPIFFS] Aviso: error al montar (sin formatear)");
+    g_spiffsReady = SPIFFS.begin(true);
+    if (g_spiffsReady)
+    {
+      Serial.println("[SPIFFS] OK: formateado y montado");
+    }
+    else
+    {
+      Serial.println("[SPIFFS] ❌ No se pudo montar SPIFFS");
+    }
   }
 
   WiFi.mode(WIFI_STA);
