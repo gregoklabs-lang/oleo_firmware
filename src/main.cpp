@@ -90,12 +90,6 @@ namespace
 
   bool setupAWS()
   {
-    if (!SPIFFS.begin(true))
-    {
-      Serial.println("[SPIFFS] ❌ Error al montar");
-      return false;
-    }
-
     if (!SPIFFS.exists(ROOT_CA_PATH) || !SPIFFS.exists(CERT_PATH) || !SPIFFS.exists(KEY_PATH))
     {
       Serial.println("[AWS] ❌ Certificados no encontrados en SPIFFS");
@@ -507,6 +501,7 @@ namespace
         Provisioning::notifyStatus("wifi:conectado");
         setupAWS();     
         connectAWS();   // 👈 Se conecta a AWS inmediatamente
+        g_claimPending = true;
         stopBleSession();
       }
       g_wifiConnecting = false;
@@ -549,6 +544,15 @@ namespace
 void setup()
 {
   Serial.begin(115200);
+
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println("[SPIFFS] ❌ Error al iniciar");
+  }
+  else
+  {
+    Serial.println("[SPIFFS] ✅ SPIFFS montado correctamente");
+  }
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
