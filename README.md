@@ -1,57 +1,60 @@
-# Firmware ESP32 – Integración BLE + AWS IoT
+# Firmware ESP32 - Integracion BLE + AWS IoT
 
-## Resumen Ejecutivo
-Firmware para ESP32-C3 (board `adafruit_qtpy_esp32c3`) que gestiona provisión BLE, conexión Wi-Fi y publicación MQTT segura hacia AWS IoT Core. Se coordina con:
+## Panorama general
+Firmware para ESP32-C3 (board `adafruit_qtpy_esp32c3`) que gestiona la provision BLE, la conexion Wi-Fi y la comunicacion MQTT segura con AWS IoT Core. El dispositivo se integra con:
 - Lambda como router de mensajes hacia Supabase.
-- Supabase (persistencia, RLS, vistas).
-- App Flutter con vistas en tiempo real (topics reclamados y estados).
+- Supabase para persistencia, reglas RLS y vistas analiticas.
+- App Flutter que refleja estados en tiempo real mediante topics MQTT.
 
-## Stack Base
-- **Framework**: Arduino (PlatformIO).
-- **Librerías clave**: `WiFi`, `BLEDevice`, `PubSubClient`, `U8g2` (OLED), `Preferences`, `SPIFFS`.
-- **Certificados**: almacenados en `data/certs`, desplegados en SPIFFS (`AmazonRootCA1.pem`, `device.pem.crt`, `private.pem.key`).
-- **Particiones**: `huge_app.csv` para disponer de memoria de programa amplia.
+## Arquitectura de punta a punta
+- **Dispositivo**: ESP32-C3 con BLE de aprovisionamiento, interfaz OLED y conectividad Wi-Fi.
+- **AWS IoT Core**: Endpoint `a7xxu98k219gv-ats.iot.us-east-1.amazonaws.com` con autenticacion mutua (Root CA + certificado + llave privada).
+- **AWS Lambda**: Normaliza y enruta mensajes entrantes desde `devices/<device_id>/claim` hacia Supabase.
+- **Supabase**: Guarda claims y estados del dispositivo, expone vistas protegidas por RLS para la app.
+- **App Flutter**: Gestiona onboarding del usuario, alimenta credenciales al dispositivo via BLE y presenta estados en vivo.
 
-## Flujo General de Ciclo de Vida
-1. **Boot & SPIFFS**: Monta SPIFFS, intenta formatear si falla; registra eventos por serial.
-2. **Identidad**: Genera `device_id` derivado de MAC (`OLEO_XXXXXX`), persiste en NVS y programa log diferido de identidad (MAC y `user_id`).
-3. **Display**: Inicializa OLED U8g2; representa conectividad Wi-Fi o BLE activo mediante icono circular y parpadeo.
-4. **Provisioning BLE**: Prepara servicio BLE custom y característica RW/notify; en reposo anuncia “inactivo”.
-5. **Conexión Wi-Fi**: Si hay credenciales almacenadas usa `WiFi.begin`; si fallan o no existen, queda a la espera de BLE.
-6. **AWS IoT Core**: Tras Wi-Fi conecta MQTT TLS mutual auth; publica reclamo (`devices/<device_id>/claim`) con `device_id` y `user_id`.
-7. **Loop Principal**: Verifica botón, timeouts BLE, estado Wi-Fi, reconexión AWS, cola de eventos BLE y refresco OLED.
+## Flujo operativo
+1. **Boot y SPIFFS**: Monta SPIFFS y, en caso de error, intenta formatear y volver a montar. Emite logs por Serial.
+2. **Identidad**: Calcula `device_id` (prefijo `OLEO_` + sufijo de MAC), lo guarda en NVS y agenda log diferido con `user_id` y direccion MAC.
+3. **Display**: Inicializa U8g2 sobre I2C con un icono circular que refleja conectividad (relleno, contorno o parpadeo).
+4. **Provisioning BLE**: Servicio y caracteristica personalizadas aceptan payload `SSID|password|user_id` o con saltos de linea. La cola FreeRTOS desacopla callbacks y evita trabajo pesado en interrupciones.
+5. **Boton fisico**: GPIO0 con interrupcion (debounce + presion prolongada de 3 s) que borra credenciales Wi-Fi y activa sesion BLE de 60 s.
+6. **Conexion Wi-Fi**: Se conecta con credenciales existentes o espera nuevas via BLE. Publica estados a la app (`wifi:conectando`, `wifi:conectado`, `wifi:error`).
+7. **AWS IoT Core**: Tras asociarse a la red Wi-Fi, carga certificados desde SPIFFS y establece cliente MQTT TLS (buffer 1 KB, reintento cada 5 s). Publica claim JSON en `devices/<device_id>/claim`.
+8. **Loop principal**: Procesa boton, expiracion BLE, estado Wi-Fi, reconexiones AWS, cola de eventos y refresco OLED con `delay(1)` para ceder CPU.
 
-## Provisión BLE
-- **Servicio/Característica** UUID fijos (sin emparejamiento).
-- **Entrada**: Cadena `SSID|password|user_id` (o saltos de línea). Valida vacíos y longitudes; si hay error envía `error:<causa>`.
-- **Cola**: Usa `FreeRTOS` queue para desacoplar eventos y mantener ISR ligeros.
-- **Notificaciones**: `inactivo`, `activo`, `credenciales`, `wifi:conectando`, `wifi:conectado`, `wifi:error`, etc.
-- **Activación**: Botón físico (GPIO0) con debounce + detección de presión larga (3 s) que borra credenciales previas y reinicia sesión BLE de 60 s.
+## Componentes clave del firmware
+- **src/main.cpp**: Orquesta estados globales, manejo de Wi-Fi/BLE/AWS, logs con prefijo `device_id` y scheduler de identidad.
+- **src/provisioning.cpp / provisioning.h**: Encapsula BLE GATT, parseo defensivo de credenciales (trim, limites de longitud) y notificaciones reactivas.
+- **src/oled_display.cpp / oled_display.h**: Abstraccion para U8g2, gestiona parpadeo cuando BLE esta activo.
+- **data/certs/**: Certificados PEM que se cargan en SPIFFS (`AmazonRootCA1.pem`, `device.pem.crt`, `private.pem.key`).
+- **platformio.ini**: Define entorno `adafruit_qtpy_esp32c3`, monitor serie 9600, particiones `huge_app.csv` y dependencias (PubSubClient, U8g2, ArduinoJson).
 
-## Conectividad Wi-Fi y AWS
-- **Reintento Wi-Fi**: seguimiento de temporizador (`kWifiConnectTimeoutMs=15s`), reporta a BLE en caso de error.
-- **Reconexión**: `WiFi.setAutoReconnect(true)` y `mqttClient.loop()` en main loop. Retraso entre intentos MQTT (`kAwsReconnectDelayMs=5s`).
-- **Claim**: `mqttClient.publish` a topic `devices/<device_id>/claim`. La Lambda receptora infiere `user_id` y sincroniza con Supabase.
-- **Persistencia usuario**: `Preferences` (namespace `identity`) guarda `user_id` recibido vía BLE.
+## Configuracion y despliegue
+- Copiar certificados actualizados a `data/certs` y ejecutar `pio run --target uploadfs` para montarlos en SPIFFS.
+- Ajustar `AWS_IOT_ENDPOINT`, topics y puertos segun ambiente (dev, staging, prod) antes del build.
+- Programar el binario con `pio run --target upload` y validar logs en el monitor serie (9600 bps).
+- Verificar que la app Flutter detecte el anuncio BLE (nombre `device_id`) y pueda enviar credenciales.
 
-## Estados Visuales
-- **Wi-Fi estable**: círculo sólido.
-- **BLE activo**: círculo parpadeando (600 ms).
-- **Sin conexión**: solo contorno.
+## Observabilidad y soporte
+- Logs serializados mediante `logWithDeviceId` para facilitar trazabilidad multi-dispositivo.
+- Notificaciones BLE oportunas para la app durante provisioning y fallas.
+- OLED como indicador local para personal de campo sin necesidad de consola.
 
-## Diagnóstico y Observabilidad
-- **Serial**: `logWithDeviceId` antepone `device_id` a los mensajes.
-- **Eventos**: registra `BLE`, `WIFI`, `AWS`, `IDENTIDAD`, `SPIFFS`.
-- **Temporización**: `delay(1)` en loop para ceder CPU.
+## Puntos de mejora para produccion comercial
+- **Seguridad de certificados**: SPIFFS sin cifrado; evaluar NVS cifrado, secure element o PKCS#11 con rotacion remota.
+- **Resiliencia MQTT**: Agregar backoff exponencial real, watchdog de reconexion, QoS1/QoS2 segun SLA y suscripciones de control (comandos remotos).
+- **Provisionamiento seguro**: Evaluar emparejamiento BLE o token de un solo uso para evitar aprovisionamientos no autorizados.
+- **Gestion Wi-Fi avanzada**: Escaneo activo, memoria de redes priorizadas, reintentos graduados y actualizacion remota de credenciales desde backend.
+- **Telemetria ampliada**: Enviar eventos de estado, metricas de uptime y errores a topics secundarios para monitoreo.
+- **Estrategia OTA**: Integrar actualizaciones via AWS IoT Jobs u otra solucion robusta con rollback.
+- **UX de campo**: Mensajes textuales breves en la OLED ante fallas y modo ahorro de energia cuando no hay actividad.
+- **Testing automatizado**: Crear pruebas unitarias para parsing de credenciales, colas BLE y reconexion MQTT; considerar CI con simulaciones de Wi-Fi.
+- **Configuracion parametrica**: Externalizar constantes (endpoints, topics, timers) en archivo de configuracion o particion NVS editable.
 
-## Puntos de Mejora (Producción Comercial)
-- **Seguridad Certificados**: SPIFFS sin cifrado; considerar NVS cifrado, secure element o PKCS#11/HSM junto con política de rotación automatizada.
-- **Resiliencia MQTT**: Falta suscripción/ACK inbound, heartbeats explícitos, backoff exponencial y watchdog de conectividad; agregar QoS1/2 según SLA.
-- **Provisioning BLE**: Añadir pairing/bonding o autenticación out-of-band; proteger frente a provisiones maliciosas y registrar intentos fallidos.
-- **Gestión Wi-Fi**: Implementar escaneo activo, prioridad de redes y política de reintentos escalonados; contemplar actualización dinámica de credenciales vía backend.
-- **Logs & Telemetría**: Integrar niveles de log, buffering y envío a backend (por ejemplo topic `events/`), más métricas de rendimiento/errores.
-- **Mantenimiento**: Incluir estrategia OTA (esp_http_client / AWS Jobs) y control de versiones del firmware.
-- **Botón físico**: Definir fallback para rebotes extremos y notificar cancelaciones si se suelta antes del umbral.
-- **OLED UX**: Añadir mensajes textuales breves sobre fallos (en lugar de solo iconos) y modo ahorro energía con dimming.
-- **Testing**: Incorporar pruebas unitarias/mocks para parsing de credenciales, colas BLE y reconexiones AWS, además de tests de estrés BLE concurrente.
-- **Configuración**: Externalizar endpoint y topics a `config` en NVS/SPIFFS editable para distintas etapas (dev/staging/prod); automatizar carga de certificados por entorno.
+## Checklist sugerido antes de liberar
+- Claim recibido en Lambda y reflejado en Supabase con `user_id` correcto.
+- BLE se desactiva tras 60 s o al conectar Wi-Fi, sin fugas de memoria.
+- MQTT se reconecta tras perdida de Wi-Fi en menos de 30 s.
+- OLED refleja estados correctos durante provisioning y fallas inducidas.
+- Pruebas de presion larga del boton con rebotes controlados en hardware objetivo.
