@@ -5,6 +5,7 @@
 #include <Preferences.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
 #include <FS.h>
 #include <SPIFFS.h>
 
@@ -46,6 +47,27 @@ namespace
   constexpr char kPrefsNamespace[] = "identity";
   constexpr char kPrefsDeviceIdKey[] = "device_id";
   constexpr char kPrefsUserIdKey[] = "user_id";
+
+  Preferences g_settingsPrefs;
+  bool g_settingsPrefsReady = false;
+  constexpr char kSettingsPrefsNamespace[] = "settings";
+  constexpr char kSettingsReservoirSizeKey[] = "res_size";
+  constexpr char kSettingsReservoirUnitsKey[] = "res_units";
+  constexpr char kSettingsTempUnitsKey[] = "temp_units";
+  constexpr char kSettingsNutrientsUnitsKey[] = "nutri_units";
+  constexpr char kSettingsEmailKey[] = "email_notif";
+
+  struct DownlinkSettings
+  {
+    float reservoirSize = 0.0f;
+    String reservoirUnits;
+    String temperatureUnits;
+    String nutrientsUnits;
+    bool emailNotifications = false;
+  };
+
+  DownlinkSettings g_downlinkSettings;
+  String g_downlinkSettingsTopic;
 
   String g_deviceId;
   String g_userId;
@@ -90,6 +112,147 @@ namespace
   }
 
   void IRAM_ATTR onBleButtonPressed() { g_bleButtonInterrupt = true; }
+
+  // =========================================================
+  // 🔽 DOWNLINK SETTINGS HANDLER
+  // =========================================================
+
+  bool beginSettingsPrefs()
+  {
+    if (g_settingsPrefsReady)
+    {
+      return true;
+    }
+
+    g_settingsPrefsReady = g_settingsPrefs.begin(kSettingsPrefsNamespace, false);
+    if (!g_settingsPrefsReady)
+    {
+      Serial.println("[settings] No se pudieron abrir las preferencias");
+    }
+    return g_settingsPrefsReady;
+  }
+
+  void loadSettingsFromPrefs()
+  {
+    if (!beginSettingsPrefs())
+    {
+      logWithDeviceId("[SETTINGS] ⚠️ No se pudieron cargar las preferencias\n");
+      return;
+    }
+
+    const bool hasAnyStored =
+        g_settingsPrefs.isKey(kSettingsReservoirSizeKey) ||
+        g_settingsPrefs.isKey(kSettingsReservoirUnitsKey) ||
+        g_settingsPrefs.isKey(kSettingsTempUnitsKey) ||
+        g_settingsPrefs.isKey(kSettingsNutrientsUnitsKey) ||
+        g_settingsPrefs.isKey(kSettingsEmailKey);
+
+    g_downlinkSettings.reservoirSize = g_settingsPrefs.getFloat(kSettingsReservoirSizeKey, g_downlinkSettings.reservoirSize);
+    g_downlinkSettings.reservoirUnits = g_settingsPrefs.getString(kSettingsReservoirUnitsKey, g_downlinkSettings.reservoirUnits);
+    g_downlinkSettings.temperatureUnits = g_settingsPrefs.getString(kSettingsTempUnitsKey, g_downlinkSettings.temperatureUnits);
+    g_downlinkSettings.nutrientsUnits = g_settingsPrefs.getString(kSettingsNutrientsUnitsKey, g_downlinkSettings.nutrientsUnits);
+    g_downlinkSettings.emailNotifications = g_settingsPrefs.getBool(kSettingsEmailKey, g_downlinkSettings.emailNotifications);
+
+    if (!hasAnyStored)
+    {
+      logWithDeviceId("[SETTINGS] ⚠️ No hay configuraciones almacenadas\n");
+      return;
+    }
+
+    logWithDeviceId("[SETTINGS] 🔁 Cargadas desde NVS:\n");
+    logWithDeviceId("   - Reservoir: %.2f %s\n", g_downlinkSettings.reservoirSize, g_downlinkSettings.reservoirUnits.c_str());
+    logWithDeviceId("   - Temp units: %s\n", g_downlinkSettings.temperatureUnits.c_str());
+    logWithDeviceId("   - Nutrients units: %s\n", g_downlinkSettings.nutrientsUnits.c_str());
+    logWithDeviceId("   - Email notifications: %d\n", g_downlinkSettings.emailNotifications ? 1 : 0);
+  }
+
+  void mqttCallback(char *topic, byte *payload, unsigned int length)
+  {
+    if (!topic)
+    {
+      logWithDeviceId("[MQTT] ⚠️ Callback sin topic\n");
+      return;
+    }
+
+    const String topicStr(topic);
+    if (!g_downlinkSettingsTopic.length() || topicStr != g_downlinkSettingsTopic)
+    {
+      // Ignora otros topics manteniendo el loop limpio.
+      return;
+    }
+
+    String payloadStr;
+    payloadStr.reserve(length + 1);
+    for (unsigned int i = 0; i < length; ++i)
+    {
+      payloadStr += static_cast<char>(payload[i]);
+    }
+
+    logWithDeviceId("📩 [MQTT] Mensaje en %s:\n", topicStr.c_str());
+    logWithDeviceId("%s\n", payloadStr.c_str());
+
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, payloadStr);
+    if (err)
+    {
+      logWithDeviceId("[MQTT] ⚠️ Error al parsear JSON: %s\n", err.c_str());
+      return;
+    }
+
+    const char *cmd = doc["cmd"] | "";
+    if (strcmp(cmd, "update_settings") != 0)
+    {
+      logWithDeviceId("[MQTT] ⚠️ Comando inesperado: %s\n", cmd);
+      return;
+    }
+
+    if (!doc.containsKey("settings"))
+    {
+      logWithDeviceId("[MQTT] ⚠️ Campo 'settings' ausente\n");
+      return;
+    }
+
+    JsonObject settings = doc["settings"];
+    if (settings.isNull())
+    {
+      logWithDeviceId("[MQTT] ⚠️ Objeto 'settings' vacio\n");
+      return;
+    }
+
+    if (settings["reservoir_size"].isNull() ||
+        settings["reservoir_size_units"].isNull() ||
+        settings["temperature_units"].isNull() ||
+        settings["nutrients_units"].isNull() ||
+        settings["email_notifications"].isNull())
+    {
+      logWithDeviceId("[MQTT] ⚠️ Configuración incompleta recibida\n");
+      return;
+    }
+
+    g_downlinkSettings.reservoirSize = settings["reservoir_size"].as<float>();
+    g_downlinkSettings.reservoirUnits = settings["reservoir_size_units"].as<const char *>();
+    g_downlinkSettings.temperatureUnits = settings["temperature_units"].as<const char *>();
+    g_downlinkSettings.nutrientsUnits = settings["nutrients_units"].as<const char *>();
+    g_downlinkSettings.emailNotifications = settings["email_notifications"].as<bool>();
+
+    if (!beginSettingsPrefs())
+    {
+      logWithDeviceId("[MQTT] ⚠️ No se pudieron abrir preferencias para guardar ajustes\n");
+      return;
+    }
+
+    g_settingsPrefs.putFloat(kSettingsReservoirSizeKey, g_downlinkSettings.reservoirSize);
+    g_settingsPrefs.putString(kSettingsReservoirUnitsKey, g_downlinkSettings.reservoirUnits);
+    g_settingsPrefs.putString(kSettingsTempUnitsKey, g_downlinkSettings.temperatureUnits);
+    g_settingsPrefs.putString(kSettingsNutrientsUnitsKey, g_downlinkSettings.nutrientsUnits);
+    g_settingsPrefs.putBool(kSettingsEmailKey, g_downlinkSettings.emailNotifications);
+
+    logWithDeviceId("✅ Nueva configuración recibida:\n");
+    logWithDeviceId("   - Reservoir: %.2f %s\n", g_downlinkSettings.reservoirSize, g_downlinkSettings.reservoirUnits.c_str());
+    logWithDeviceId("   - Temp units: %s\n", g_downlinkSettings.temperatureUnits.c_str());
+    logWithDeviceId("   - Nutrients units: %s\n", g_downlinkSettings.nutrientsUnits.c_str());
+    logWithDeviceId("   - Email notifications: %d\n", g_downlinkSettings.emailNotifications ? 1 : 0);
+  }
 
   // ========================== AWS HELPERS
 
@@ -153,6 +316,7 @@ namespace
 
     mqttClient.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
     mqttClient.setBufferSize(1024);
+    mqttClient.setCallback(mqttCallback);
     g_awsCredentialsLoaded = true;
     logWithDeviceId("[AWS] Configuracion MQTT lista\n");
     return true;
@@ -175,6 +339,18 @@ namespace
     if (mqttClient.connect(g_deviceId.c_str()))
     {
       Serial.println("✅ Conectado");
+      const char *settingsTopic = g_downlinkSettingsTopic.c_str();
+      if (settingsTopic && settingsTopic[0] != '\0')
+      {
+        if (mqttClient.subscribe(settingsTopic))
+        {
+          logWithDeviceId("[MQTT] Suscrito a %s\n", settingsTopic);
+        }
+        else
+        {
+          logWithDeviceId("[MQTT] ⚠️ Fallo al suscribir %s\n", settingsTopic);
+        }
+      }
       g_awsConnected = true;
       return true;
     }
@@ -621,6 +797,8 @@ void setup()
   loadStoredUserId();
   scheduleIdentityLog();
   logWithDeviceId("[BOOT] device_id: %s\n", g_deviceId.c_str());
+  g_downlinkSettingsTopic = "devices/" + g_deviceId + "/downlink/settings";
+  loadSettingsFromPrefs();
 
   Display::begin();
   Display::setConnectionStatus(false);
