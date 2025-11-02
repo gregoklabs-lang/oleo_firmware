@@ -51,7 +51,6 @@ namespace
   Preferences g_settingsPrefs;
   bool g_settingsPrefsReady = false;
   constexpr char kSettingsPrefsNamespace[] = "settings";
-  constexpr char kSettingsReservoirSizeKey[] = "res_size";
   constexpr char kSettingsReservoirUnitsKey[] = "res_units";
   constexpr char kSettingsTempUnitsKey[] = "temp_units";
   constexpr char kSettingsNutrientsUnitsKey[] = "nutri_units";
@@ -59,7 +58,6 @@ namespace
 
   struct DownlinkSettings
   {
-    float reservoirSize = 0.0f;
     String reservoirUnits;
     String temperatureUnits;
     String nutrientsUnits;
@@ -141,13 +139,11 @@ namespace
     }
 
     const bool hasAnyStored =
-        g_settingsPrefs.isKey(kSettingsReservoirSizeKey) ||
         g_settingsPrefs.isKey(kSettingsReservoirUnitsKey) ||
         g_settingsPrefs.isKey(kSettingsTempUnitsKey) ||
         g_settingsPrefs.isKey(kSettingsNutrientsUnitsKey) ||
         g_settingsPrefs.isKey(kSettingsEmailKey);
 
-    g_downlinkSettings.reservoirSize = g_settingsPrefs.getFloat(kSettingsReservoirSizeKey, g_downlinkSettings.reservoirSize);
     g_downlinkSettings.reservoirUnits = g_settingsPrefs.getString(kSettingsReservoirUnitsKey, g_downlinkSettings.reservoirUnits);
     g_downlinkSettings.temperatureUnits = g_settingsPrefs.getString(kSettingsTempUnitsKey, g_downlinkSettings.temperatureUnits);
     g_downlinkSettings.nutrientsUnits = g_settingsPrefs.getString(kSettingsNutrientsUnitsKey, g_downlinkSettings.nutrientsUnits);
@@ -160,7 +156,7 @@ namespace
     }
 
     logWithDeviceId("[SETTINGS] 🔁 Cargadas desde NVS:\n");
-    logWithDeviceId("   - Reservoir: %.2f %s\n", g_downlinkSettings.reservoirSize, g_downlinkSettings.reservoirUnits.c_str());
+    logWithDeviceId("   - Reservoir units: %s\n", g_downlinkSettings.reservoirUnits.c_str());
     logWithDeviceId("   - Temp units: %s\n", g_downlinkSettings.temperatureUnits.c_str());
     logWithDeviceId("   - Nutrients units: %s\n", g_downlinkSettings.nutrientsUnits.c_str());
     logWithDeviceId("   - Email notifications: %d\n", g_downlinkSettings.emailNotifications ? 1 : 0);
@@ -200,7 +196,10 @@ namespace
     }
 
     const char *cmd = doc["cmd"] | "";
-    if (strcmp(cmd, "update_settings") != 0)
+    const bool isUpdateSettings =
+        strcmp(cmd, "update_settings") == 0 ||
+        strcmp(cmd, "update_user_settings") == 0;
+    if (!isUpdateSettings)
     {
       logWithDeviceId("[MQTT] ⚠️ Comando inesperado: %s\n", cmd);
       return;
@@ -219,8 +218,7 @@ namespace
       return;
     }
 
-    if (settings["reservoir_size"].isNull() ||
-        settings["reservoir_size_units"].isNull() ||
+    if (settings["reservoir_size_units"].isNull() ||
         settings["temperature_units"].isNull() ||
         settings["nutrients_units"].isNull() ||
         settings["email_notifications"].isNull())
@@ -229,7 +227,6 @@ namespace
       return;
     }
 
-    g_downlinkSettings.reservoirSize = settings["reservoir_size"].as<float>();
     g_downlinkSettings.reservoirUnits = settings["reservoir_size_units"].as<const char *>();
     g_downlinkSettings.temperatureUnits = settings["temperature_units"].as<const char *>();
     g_downlinkSettings.nutrientsUnits = settings["nutrients_units"].as<const char *>();
@@ -241,14 +238,13 @@ namespace
       return;
     }
 
-    g_settingsPrefs.putFloat(kSettingsReservoirSizeKey, g_downlinkSettings.reservoirSize);
     g_settingsPrefs.putString(kSettingsReservoirUnitsKey, g_downlinkSettings.reservoirUnits);
     g_settingsPrefs.putString(kSettingsTempUnitsKey, g_downlinkSettings.temperatureUnits);
     g_settingsPrefs.putString(kSettingsNutrientsUnitsKey, g_downlinkSettings.nutrientsUnits);
     g_settingsPrefs.putBool(kSettingsEmailKey, g_downlinkSettings.emailNotifications);
 
     logWithDeviceId("✅ Nueva configuración recibida:\n");
-    logWithDeviceId("   - Reservoir: %.2f %s\n", g_downlinkSettings.reservoirSize, g_downlinkSettings.reservoirUnits.c_str());
+    logWithDeviceId("   - Reservoir units: %s\n", g_downlinkSettings.reservoirUnits.c_str());
     logWithDeviceId("   - Temp units: %s\n", g_downlinkSettings.temperatureUnits.c_str());
     logWithDeviceId("   - Nutrients units: %s\n", g_downlinkSettings.nutrientsUnits.c_str());
     logWithDeviceId("   - Email notifications: %d\n", g_downlinkSettings.emailNotifications ? 1 : 0);
