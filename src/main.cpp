@@ -56,6 +56,17 @@ namespace
   constexpr char kSettingsNutrientsUnitsKey[] = "nutri_units";
   constexpr char kSettingsEmailKey[] = "email_notif";
 
+  Preferences g_setpointsPrefs;
+  bool g_setpointsPrefsReady = false;
+  constexpr char kSetpointsPrefsNamespace[] = "setpoints";
+  constexpr char kSetpointsPhKey[] = "ph_target";
+  constexpr char kSetpointsEcKey[] = "ec_target";
+  constexpr char kSetpointsTempKey[] = "temp_target";
+  constexpr char kSetpointsFlowKey[] = "flow_target";
+  constexpr char kSetpointsModeKey[] = "dosing_mode";
+  constexpr char kSetpointsVersionKey[] = "version";
+  constexpr char kSetpointsReservoirKey[] = "reservoir";
+
   struct DownlinkSettings
   {
     String reservoirUnits;
@@ -66,6 +77,20 @@ namespace
 
   DownlinkSettings g_downlinkSettings;
   String g_downlinkSettingsTopic;
+
+  struct DownlinkSetpoints
+  {
+    float phTarget = 0.0f;
+    float ecTarget = 0.0f;
+    float tempTarget = 0.0f;
+    float flowTarget = 0.0f;
+    String dosingMode;
+    String version;
+    float reservoirSize = 0.0f;
+  };
+
+  DownlinkSetpoints g_downlinkSetpoints;
+  String g_downlinkSetpointsTopic;
 
   String g_deviceId;
   String g_userId;
@@ -107,6 +132,11 @@ namespace
 
     const char *deviceId = g_deviceId.length() > 0 ? g_deviceId.c_str() : "UNKNOWN";
     Serial.printf("[%s] %s", deviceId, buffer);
+  }
+
+  const char *unitsOrDefault(const String &value, const char *fallback)
+  {
+    return value.length() > 0 ? value.c_str() : fallback;
   }
 
   void IRAM_ATTR onBleButtonPressed() { g_bleButtonInterrupt = true; }
@@ -155,6 +185,38 @@ namespace
       return;
     }
 
+    const bool hasSetpointsStored =
+        g_setpointsPrefsReady &&
+        (g_setpointsPrefs.isKey(kSetpointsPhKey) ||
+         g_setpointsPrefs.isKey(kSetpointsEcKey) ||
+         g_setpointsPrefs.isKey(kSetpointsTempKey) ||
+         g_setpointsPrefs.isKey(kSetpointsFlowKey) ||
+         g_setpointsPrefs.isKey(kSetpointsModeKey) ||
+         g_setpointsPrefs.isKey(kSetpointsVersionKey) ||
+         g_setpointsPrefs.isKey(kSetpointsReservoirKey));
+
+    if (hasSetpointsStored)
+    {
+      logWithDeviceId("[SETPOINTS] 🔁 Cargados desde NVS:\n");
+      logWithDeviceId("   - pH target: %.2f\n", g_downlinkSetpoints.phTarget);
+      logWithDeviceId("   - EC target: %.2f %s\n",
+                      g_downlinkSetpoints.ecTarget,
+                      unitsOrDefault(g_downlinkSettings.nutrientsUnits, "N/A"));
+      logWithDeviceId("   - Temp target: %.2f %s\n",
+                      g_downlinkSetpoints.tempTarget,
+                      unitsOrDefault(g_downlinkSettings.temperatureUnits, "N/A"));
+      logWithDeviceId("   - Flow target (L/min): %.2f\n", g_downlinkSetpoints.flowTarget);
+      logWithDeviceId("   - Dosing mode: %s\n", g_downlinkSetpoints.dosingMode.c_str());
+      logWithDeviceId("   - Version: %s\n", g_downlinkSetpoints.version.c_str());
+      logWithDeviceId("   - Reservoir size: %.2f %s\n",
+                      g_downlinkSetpoints.reservoirSize,
+                      unitsOrDefault(g_downlinkSettings.reservoirUnits, "N/A"));
+    }
+    else
+    {
+      logWithDeviceId("[SETPOINTS] ⚠️ No hay setpoints almacenados\n");
+    }
+
     logWithDeviceId("[SETTINGS] 🔁 Cargadas desde NVS:\n");
     logWithDeviceId("   - Reservoir units: %s\n", g_downlinkSettings.reservoirUnits.c_str());
     logWithDeviceId("   - Temp units: %s\n", g_downlinkSettings.temperatureUnits.c_str());
@@ -162,39 +224,71 @@ namespace
     logWithDeviceId("   - Email notifications: %d\n", g_downlinkSettings.emailNotifications ? 1 : 0);
   }
 
-  void mqttCallback(char *topic, byte *payload, unsigned int length)
+  bool beginSetpointsPrefs()
   {
-    if (!topic)
+    if (g_setpointsPrefsReady)
     {
-      logWithDeviceId("[MQTT] ⚠️ Callback sin topic\n");
+      return true;
+    }
+
+    g_setpointsPrefsReady = g_setpointsPrefs.begin(kSetpointsPrefsNamespace, false);
+    if (!g_setpointsPrefsReady)
+    {
+      logWithDeviceId("[SETPOINTS] ⚠️ No se pudieron abrir las preferencias\n");
+      return false;
+    }
+
+    return g_setpointsPrefsReady;
+  }
+
+  void loadSetpointsFromPrefs()
+  {
+    if (!beginSetpointsPrefs())
+    {
       return;
     }
 
-    const String topicStr(topic);
-    if (!g_downlinkSettingsTopic.length() || topicStr != g_downlinkSettingsTopic)
+    const bool hasAnyStored =
+        g_setpointsPrefs.isKey(kSetpointsPhKey) ||
+        g_setpointsPrefs.isKey(kSetpointsEcKey) ||
+        g_setpointsPrefs.isKey(kSetpointsTempKey) ||
+        g_setpointsPrefs.isKey(kSetpointsFlowKey) ||
+        g_setpointsPrefs.isKey(kSetpointsModeKey) ||
+        g_setpointsPrefs.isKey(kSetpointsVersionKey) ||
+        g_setpointsPrefs.isKey(kSetpointsReservoirKey);
+
+    g_downlinkSetpoints.phTarget = g_setpointsPrefs.getFloat(kSetpointsPhKey, g_downlinkSetpoints.phTarget);
+    g_downlinkSetpoints.ecTarget = g_setpointsPrefs.getFloat(kSetpointsEcKey, g_downlinkSetpoints.ecTarget);
+    g_downlinkSetpoints.tempTarget = g_setpointsPrefs.getFloat(kSetpointsTempKey, g_downlinkSetpoints.tempTarget);
+    g_downlinkSetpoints.flowTarget = g_setpointsPrefs.getFloat(kSetpointsFlowKey, g_downlinkSetpoints.flowTarget);
+    g_downlinkSetpoints.dosingMode = g_setpointsPrefs.getString(kSetpointsModeKey, g_downlinkSetpoints.dosingMode);
+    g_downlinkSetpoints.version = g_setpointsPrefs.getString(kSetpointsVersionKey, g_downlinkSetpoints.version);
+    g_downlinkSetpoints.reservoirSize = g_setpointsPrefs.getFloat(kSetpointsReservoirKey, g_downlinkSetpoints.reservoirSize);
+
+    if (!hasAnyStored)
     {
-      // Ignora otros topics manteniendo el loop limpio.
+      logWithDeviceId("[SETPOINTS] ⚠️ No hay setpoints almacenados\n");
       return;
     }
 
-    String payloadStr;
-    payloadStr.reserve(length + 1);
-    for (unsigned int i = 0; i < length; ++i)
-    {
-      payloadStr += static_cast<char>(payload[i]);
-    }
+    logWithDeviceId("[SETPOINTS] 🔁 Cargados desde NVS:\n");
+    logWithDeviceId("   - pH target: %.2f\n", g_downlinkSetpoints.phTarget);
+    logWithDeviceId("   - EC target: %.2f %s\n",
+                    g_downlinkSetpoints.ecTarget,
+                    unitsOrDefault(g_downlinkSettings.nutrientsUnits, "N/A"));
+    logWithDeviceId("   - Temp target: %.2f %s\n",
+                    g_downlinkSetpoints.tempTarget,
+                    unitsOrDefault(g_downlinkSettings.temperatureUnits, "N/A"));
+    logWithDeviceId("   - Flow target (L/min): %.2f\n", g_downlinkSetpoints.flowTarget);
+    logWithDeviceId("   - Dosing mode: %s\n", g_downlinkSetpoints.dosingMode.c_str());
+    logWithDeviceId("   - Version: %s\n", g_downlinkSetpoints.version.c_str());
+    logWithDeviceId("   - Reservoir size: %.2f %s\n",
+                    g_downlinkSetpoints.reservoirSize,
+                    unitsOrDefault(g_downlinkSettings.reservoirUnits, "N/A"));
+  }
 
-    logWithDeviceId("📩 [MQTT] Mensaje en %s:\n", topicStr.c_str());
-    logWithDeviceId("%s\n", payloadStr.c_str());
-
-    StaticJsonDocument<512> doc;
-    DeserializationError err = deserializeJson(doc, payloadStr);
-    if (err)
-    {
-      logWithDeviceId("[MQTT] ⚠️ Error al parsear JSON: %s\n", err.c_str());
-      return;
-    }
-
+  void handleSettingsDownlink(JsonDocument &doc)
+  {
     const char *cmd = doc["cmd"] | "";
     const bool isUpdateSettings =
         strcmp(cmd, "update_settings") == 0 ||
@@ -205,18 +299,13 @@ namespace
       return;
     }
 
-    if (!doc.containsKey("settings"))
+    if (!doc["settings"].is<JsonObject>())
     {
-      logWithDeviceId("[MQTT] ⚠️ Campo 'settings' ausente\n");
+      logWithDeviceId("[MQTT] ⚠️ Campo 'settings' ausente o invalido\n");
       return;
     }
 
-    JsonObject settings = doc["settings"];
-    if (settings.isNull())
-    {
-      logWithDeviceId("[MQTT] ⚠️ Objeto 'settings' vacio\n");
-      return;
-    }
+    JsonObject settings = doc["settings"].as<JsonObject>();
 
     if (settings["reservoir_size_units"].isNull() ||
         settings["temperature_units"].isNull() ||
@@ -248,6 +337,143 @@ namespace
     logWithDeviceId("   - Temp units: %s\n", g_downlinkSettings.temperatureUnits.c_str());
     logWithDeviceId("   - Nutrients units: %s\n", g_downlinkSettings.nutrientsUnits.c_str());
     logWithDeviceId("   - Email notifications: %d\n", g_downlinkSettings.emailNotifications ? 1 : 0);
+  }
+
+  void handleSetpointsDownlink(JsonDocument &doc)
+  {
+    const char *cmd = doc["cmd"] | "";
+    if (strcmp(cmd, "update_setpoints") != 0)
+    {
+      logWithDeviceId("[MQTT] ⚠️ Comando inesperado para setpoints: %s\n", cmd);
+      return;
+    }
+
+    if (!doc["setpoints"].is<JsonObject>())
+    {
+      logWithDeviceId("[MQTT] ⚠️ Campo 'setpoints' ausente o invalido\n");
+      return;
+    }
+
+    JsonObject sp = doc["setpoints"].as<JsonObject>();
+
+    bool hasUpdate = false;
+
+    if (!sp["ph_target"].isNull())
+    {
+      g_downlinkSetpoints.phTarget = sp["ph_target"].as<float>();
+      hasUpdate = true;
+    }
+    if (!sp["ec_target"].isNull())
+    {
+      g_downlinkSetpoints.ecTarget = sp["ec_target"].as<float>();
+      hasUpdate = true;
+    }
+    if (!sp["temp_target"].isNull())
+    {
+      g_downlinkSetpoints.tempTarget = sp["temp_target"].as<float>();
+      hasUpdate = true;
+    }
+    if (!sp["flow_target_l_min"].isNull())
+    {
+      g_downlinkSetpoints.flowTarget = sp["flow_target_l_min"].as<float>();
+      hasUpdate = true;
+    }
+    if (!sp["dosing_mode"].isNull())
+    {
+      g_downlinkSetpoints.dosingMode = sp["dosing_mode"].as<const char *>();
+      hasUpdate = true;
+    }
+    if (!sp["version"].isNull())
+    {
+      g_downlinkSetpoints.version = sp["version"].as<const char *>();
+      hasUpdate = true;
+    }
+    if (!sp["reservoir_size"].isNull())
+    {
+      g_downlinkSetpoints.reservoirSize = sp["reservoir_size"].as<float>();
+      hasUpdate = true;
+    }
+
+    if (!hasUpdate)
+    {
+      logWithDeviceId("[MQTT] ⚠️ Setpoints recibidos sin cambios (todos nulos)\n");
+      return;
+    }
+
+    if (!beginSetpointsPrefs())
+    {
+      logWithDeviceId("[MQTT] ⚠️ No se pudieron abrir preferencias para guardar setpoints\n");
+      return;
+    }
+
+    g_setpointsPrefs.putFloat(kSetpointsPhKey, g_downlinkSetpoints.phTarget);
+    g_setpointsPrefs.putFloat(kSetpointsEcKey, g_downlinkSetpoints.ecTarget);
+    g_setpointsPrefs.putFloat(kSetpointsTempKey, g_downlinkSetpoints.tempTarget);
+    g_setpointsPrefs.putFloat(kSetpointsFlowKey, g_downlinkSetpoints.flowTarget);
+    g_setpointsPrefs.putString(kSetpointsModeKey, g_downlinkSetpoints.dosingMode);
+    g_setpointsPrefs.putString(kSetpointsVersionKey, g_downlinkSetpoints.version);
+    g_setpointsPrefs.putFloat(kSetpointsReservoirKey, g_downlinkSetpoints.reservoirSize);
+
+    logWithDeviceId("✅ Setpoints actualizados:\n");
+    logWithDeviceId("   - pH target: %.2f\n", g_downlinkSetpoints.phTarget);
+    logWithDeviceId("   - EC target: %.2f %s\n",
+                    g_downlinkSetpoints.ecTarget,
+                    unitsOrDefault(g_downlinkSettings.nutrientsUnits, "N/A"));
+    logWithDeviceId("   - Temp target: %.2f %s\n",
+                    g_downlinkSetpoints.tempTarget,
+                    unitsOrDefault(g_downlinkSettings.temperatureUnits, "N/A"));
+    logWithDeviceId("   - Flow target (L/min): %.2f\n", g_downlinkSetpoints.flowTarget);
+    logWithDeviceId("   - Dosing mode: %s\n", g_downlinkSetpoints.dosingMode.c_str());
+    logWithDeviceId("   - Version: %s\n", g_downlinkSetpoints.version.c_str());
+    logWithDeviceId("   - Reservoir size: %.2f %s\n",
+                    g_downlinkSetpoints.reservoirSize,
+                    unitsOrDefault(g_downlinkSettings.reservoirUnits, "N/A"));
+  }
+
+  void mqttCallback(char *topic, byte *payload, unsigned int length)
+  {
+    if (!topic)
+    {
+      logWithDeviceId("[MQTT] ⚠️ Callback sin topic\n");
+      return;
+    }
+
+    const String topicStr(topic);
+    const bool isSettingsTopic = g_downlinkSettingsTopic.length() && topicStr == g_downlinkSettingsTopic;
+    const bool isSetpointsTopic = g_downlinkSetpointsTopic.length() && topicStr == g_downlinkSetpointsTopic;
+
+    if (!isSettingsTopic && !isSetpointsTopic)
+    {
+      // Ignora otros topics manteniendo el loop limpio.
+      return;
+    }
+
+    String payloadStr;
+    payloadStr.reserve(length + 1);
+    for (unsigned int i = 0; i < length; ++i)
+    {
+      payloadStr += static_cast<char>(payload[i]);
+    }
+
+    logWithDeviceId("📩 [MQTT] Mensaje en %s:\n", topicStr.c_str());
+    logWithDeviceId("%s\n", payloadStr.c_str());
+
+    DynamicJsonDocument doc(768);
+    DeserializationError err = deserializeJson(doc, payloadStr);
+    if (err)
+    {
+      logWithDeviceId("[MQTT] ⚠️ Error al parsear JSON: %s\n", err.c_str());
+      return;
+    }
+
+    if (isSettingsTopic)
+    {
+      handleSettingsDownlink(doc);
+    }
+    else if (isSetpointsTopic)
+    {
+      handleSetpointsDownlink(doc);
+    }
   }
 
   // ========================== AWS HELPERS
@@ -345,6 +571,18 @@ namespace
         else
         {
           logWithDeviceId("[MQTT] ⚠️ Fallo al suscribir %s\n", settingsTopic);
+        }
+      }
+      const char *setpointsTopic = g_downlinkSetpointsTopic.c_str();
+      if (setpointsTopic && setpointsTopic[0] != '\0')
+      {
+        if (mqttClient.subscribe(setpointsTopic))
+        {
+          logWithDeviceId("[MQTT] Suscrito a %s\n", setpointsTopic);
+        }
+        else
+        {
+          logWithDeviceId("[MQTT] ⚠️ Fallo al suscribir %s\n", setpointsTopic);
         }
       }
       g_awsConnected = true;
@@ -794,6 +1032,8 @@ void setup()
   scheduleIdentityLog();
   logWithDeviceId("[BOOT] device_id: %s\n", g_deviceId.c_str());
   g_downlinkSettingsTopic = "devices/" + g_deviceId + "/downlink/settings";
+  g_downlinkSetpointsTopic = "devices/" + g_deviceId + "/downlink/setpoints";
+  loadSetpointsFromPrefs();
   loadSettingsFromPrefs();
 
   Display::begin();
