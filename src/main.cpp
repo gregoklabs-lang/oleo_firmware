@@ -139,6 +139,36 @@ namespace
     return value.length() > 0 ? value.c_str() : fallback;
   }
 
+  void logStoredSetpoints(const char *header = "[SETPOINTS] 🔁 Cargados desde NVS:")
+  {
+    logWithDeviceId("%s\n", header);
+    logWithDeviceId("   - pH target: %.2f\n", g_downlinkSetpoints.phTarget);
+    logWithDeviceId("   - EC target: %.2f %s\n",
+                    g_downlinkSetpoints.ecTarget,
+                    unitsOrDefault(g_downlinkSettings.nutrientsUnits, "N/A"));
+    logWithDeviceId("   - Temp target: %.2f %s\n",
+                    g_downlinkSetpoints.tempTarget,
+                    unitsOrDefault(g_downlinkSettings.temperatureUnits, "N/A"));
+    logWithDeviceId("   - Flow target (L/min): %.2f\n", g_downlinkSetpoints.flowTarget);
+    logWithDeviceId("   - Dosing mode: %s\n", g_downlinkSetpoints.dosingMode.c_str());
+    logWithDeviceId("   - Version: %s\n", g_downlinkSetpoints.version.c_str());
+    logWithDeviceId("   - Reservoir size: %.2f %s\n",
+                    g_downlinkSetpoints.reservoirSize,
+                    unitsOrDefault(g_downlinkSettings.reservoirUnits, "N/A"));
+  }
+
+  void logStoredSettings(const char *header = "[SETTINGS] 🔁 Cargadas desde NVS:")
+  {
+    logWithDeviceId("%s\n", header);
+    logWithDeviceId("   - Reservoir units: %s\n",
+                    unitsOrDefault(g_downlinkSettings.reservoirUnits, "N/A"));
+    logWithDeviceId("   - Temp units: %s\n",
+                    unitsOrDefault(g_downlinkSettings.temperatureUnits, "N/A"));
+    logWithDeviceId("   - Nutrients units: %s\n",
+                    unitsOrDefault(g_downlinkSettings.nutrientsUnits, "N/A"));
+    logWithDeviceId("   - Email notifications: %d\n", g_downlinkSettings.emailNotifications ? 1 : 0);
+  }
+
   void IRAM_ATTR onBleButtonPressed() { g_bleButtonInterrupt = true; }
 
   // =========================================================
@@ -181,47 +211,10 @@ namespace
 
     if (!hasAnyStored)
     {
-      logWithDeviceId("[SETTINGS] ⚠️ No hay configuraciones almacenadas\n");
-      return;
+      logWithDeviceId("[SETTINGS] ⚠️ No hay configuraciones almacenadas (usando valores por defecto)\n");
     }
 
-    const bool hasSetpointsStored =
-        g_setpointsPrefsReady &&
-        (g_setpointsPrefs.isKey(kSetpointsPhKey) ||
-         g_setpointsPrefs.isKey(kSetpointsEcKey) ||
-         g_setpointsPrefs.isKey(kSetpointsTempKey) ||
-         g_setpointsPrefs.isKey(kSetpointsFlowKey) ||
-         g_setpointsPrefs.isKey(kSetpointsModeKey) ||
-         g_setpointsPrefs.isKey(kSetpointsVersionKey) ||
-         g_setpointsPrefs.isKey(kSetpointsReservoirKey));
-
-    if (hasSetpointsStored)
-    {
-      logWithDeviceId("[SETPOINTS] 🔁 Cargados desde NVS:\n");
-      logWithDeviceId("   - pH target: %.2f\n", g_downlinkSetpoints.phTarget);
-      logWithDeviceId("   - EC target: %.2f %s\n",
-                      g_downlinkSetpoints.ecTarget,
-                      unitsOrDefault(g_downlinkSettings.nutrientsUnits, "N/A"));
-      logWithDeviceId("   - Temp target: %.2f %s\n",
-                      g_downlinkSetpoints.tempTarget,
-                      unitsOrDefault(g_downlinkSettings.temperatureUnits, "N/A"));
-      logWithDeviceId("   - Flow target (L/min): %.2f\n", g_downlinkSetpoints.flowTarget);
-      logWithDeviceId("   - Dosing mode: %s\n", g_downlinkSetpoints.dosingMode.c_str());
-      logWithDeviceId("   - Version: %s\n", g_downlinkSetpoints.version.c_str());
-      logWithDeviceId("   - Reservoir size: %.2f %s\n",
-                      g_downlinkSetpoints.reservoirSize,
-                      unitsOrDefault(g_downlinkSettings.reservoirUnits, "N/A"));
-    }
-    else
-    {
-      logWithDeviceId("[SETPOINTS] ⚠️ No hay setpoints almacenados\n");
-    }
-
-    logWithDeviceId("[SETTINGS] 🔁 Cargadas desde NVS:\n");
-    logWithDeviceId("   - Reservoir units: %s\n", g_downlinkSettings.reservoirUnits.c_str());
-    logWithDeviceId("   - Temp units: %s\n", g_downlinkSettings.temperatureUnits.c_str());
-    logWithDeviceId("   - Nutrients units: %s\n", g_downlinkSettings.nutrientsUnits.c_str());
-    logWithDeviceId("   - Email notifications: %d\n", g_downlinkSettings.emailNotifications ? 1 : 0);
+    logStoredSettings();
   }
 
   bool beginSetpointsPrefs()
@@ -271,20 +264,7 @@ namespace
       return;
     }
 
-    logWithDeviceId("[SETPOINTS] 🔁 Cargados desde NVS:\n");
-    logWithDeviceId("   - pH target: %.2f\n", g_downlinkSetpoints.phTarget);
-    logWithDeviceId("   - EC target: %.2f %s\n",
-                    g_downlinkSetpoints.ecTarget,
-                    unitsOrDefault(g_downlinkSettings.nutrientsUnits, "N/A"));
-    logWithDeviceId("   - Temp target: %.2f %s\n",
-                    g_downlinkSetpoints.tempTarget,
-                    unitsOrDefault(g_downlinkSettings.temperatureUnits, "N/A"));
-    logWithDeviceId("   - Flow target (L/min): %.2f\n", g_downlinkSetpoints.flowTarget);
-    logWithDeviceId("   - Dosing mode: %s\n", g_downlinkSetpoints.dosingMode.c_str());
-    logWithDeviceId("   - Version: %s\n", g_downlinkSetpoints.version.c_str());
-    logWithDeviceId("   - Reservoir size: %.2f %s\n",
-                    g_downlinkSetpoints.reservoirSize,
-                    unitsOrDefault(g_downlinkSettings.reservoirUnits, "N/A"));
+    logStoredSetpoints();
   }
 
   void handleSettingsDownlink(JsonDocument &doc)
@@ -332,11 +312,7 @@ namespace
     g_settingsPrefs.putString(kSettingsNutrientsUnitsKey, g_downlinkSettings.nutrientsUnits);
     g_settingsPrefs.putBool(kSettingsEmailKey, g_downlinkSettings.emailNotifications);
 
-    logWithDeviceId("✅ Nueva configuración recibida:\n");
-    logWithDeviceId("   - Reservoir units: %s\n", g_downlinkSettings.reservoirUnits.c_str());
-    logWithDeviceId("   - Temp units: %s\n", g_downlinkSettings.temperatureUnits.c_str());
-    logWithDeviceId("   - Nutrients units: %s\n", g_downlinkSettings.nutrientsUnits.c_str());
-    logWithDeviceId("   - Email notifications: %d\n", g_downlinkSettings.emailNotifications ? 1 : 0);
+    logStoredSettings("[SETTINGS] ✅ Actualizadas desde downlink:");
   }
 
   void handleSetpointsDownlink(JsonDocument &doc)
@@ -414,20 +390,7 @@ namespace
     g_setpointsPrefs.putString(kSetpointsVersionKey, g_downlinkSetpoints.version);
     g_setpointsPrefs.putFloat(kSetpointsReservoirKey, g_downlinkSetpoints.reservoirSize);
 
-    logWithDeviceId("✅ Setpoints actualizados:\n");
-    logWithDeviceId("   - pH target: %.2f\n", g_downlinkSetpoints.phTarget);
-    logWithDeviceId("   - EC target: %.2f %s\n",
-                    g_downlinkSetpoints.ecTarget,
-                    unitsOrDefault(g_downlinkSettings.nutrientsUnits, "N/A"));
-    logWithDeviceId("   - Temp target: %.2f %s\n",
-                    g_downlinkSetpoints.tempTarget,
-                    unitsOrDefault(g_downlinkSettings.temperatureUnits, "N/A"));
-    logWithDeviceId("   - Flow target (L/min): %.2f\n", g_downlinkSetpoints.flowTarget);
-    logWithDeviceId("   - Dosing mode: %s\n", g_downlinkSetpoints.dosingMode.c_str());
-    logWithDeviceId("   - Version: %s\n", g_downlinkSetpoints.version.c_str());
-    logWithDeviceId("   - Reservoir size: %.2f %s\n",
-                    g_downlinkSetpoints.reservoirSize,
-                    unitsOrDefault(g_downlinkSettings.reservoirUnits, "N/A"));
+    logStoredSetpoints("[SETPOINTS] ✅ Actualizados desde downlink:");
   }
 
   void mqttCallback(char *topic, byte *payload, unsigned int length)
@@ -1033,8 +996,8 @@ void setup()
   logWithDeviceId("[BOOT] device_id: %s\n", g_deviceId.c_str());
   g_downlinkSettingsTopic = "devices/" + g_deviceId + "/downlink/settings";
   g_downlinkSetpointsTopic = "devices/" + g_deviceId + "/downlink/setpoints";
-  loadSetpointsFromPrefs();
   loadSettingsFromPrefs();
+  loadSetpointsFromPrefs();
 
   Display::begin();
   Display::setConnectionStatus(false);
