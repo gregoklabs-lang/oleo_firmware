@@ -14,7 +14,10 @@
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <SPIFFS.h>
+#include <cstring>
+#include <string>
 
+#include "Config.hpp"
 #include "oled_display.h"
 #include "provisioning.h"
 
@@ -33,12 +36,29 @@
 // ======================
 // 🔹 CONFIGURACIÓN AWS
 // ======================
-const char *AWS_IOT_ENDPOINT = "a7xxu98k219gv-ats.iot.us-east-1.amazonaws.com";
-const int AWS_IOT_PORT = 8883;
-
-#define ROOT_CA_PATH "/certs/AmazonRootCA1.pem"
-#define CERT_PATH "/certs/device.pem.crt"
-#define KEY_PATH "/certs/private.pem.key"
+constexpr const char kDefaultAwsEndpoint[] = "a7xxu98k219gv-ats.iot.us-east-1.amazonaws.com";
+constexpr int32_t kDefaultAwsPort = 8883;
+constexpr const char kDefaultAwsRegion[] = "us-east-1";
+constexpr const char kDefaultThingName[] = "";
+constexpr const char kDefaultEnv[] = "prod";
+constexpr const char kDefaultRootCaPath[] = "/certs/AmazonRootCA1.pem";
+constexpr const char kDefaultDeviceCertPath[] = "/certs/device.pem.crt";
+constexpr const char kDefaultPrivateKeyPath[] = "/certs/private.pem.key";
+constexpr const char kDiagWifiKey[] = "wifi_fail";
+constexpr const char kDiagMqttKey[] = "mqtt_fail";
+constexpr const char kDiagResetKey[] = "last_reset";
+constexpr const char kCertRootKey[] = "root_ca";
+constexpr const char kCertDeviceKey[] = "device_cert";
+constexpr const char kCertPrivateKey[] = "private_key";
+constexpr const char kAwsEndpointKey[] = "endpoint";
+constexpr const char kAwsPortKey[] = "port";
+constexpr const char kAwsThingKey[] = "thing";
+constexpr const char kAwsRegionKey[] = "region";
+constexpr const char kDeviceIdKey[] = "device_id";
+constexpr const char kDeviceUserKey[] = "user_id";
+constexpr const char kDeviceEnvKey[] = "env";
+constexpr const char kWifiSsidKey[] = "ssid";
+constexpr const char kWifiPassKey[] = "password";
 
 esp_mqtt_client_handle_t g_mqttClient = nullptr;
 
@@ -66,12 +86,6 @@ namespace
     WIFI_CONNECTED,
     BLE_ACTIVE,
   };
-
-  Preferences g_identityPrefs;
-  bool g_identityPrefsReady = false;
-  constexpr char kPrefsNamespace[] = "identity";
-  constexpr char kPrefsDeviceIdKey[] = "device_id";
-  constexpr char kPrefsUserIdKey[] = "user_id";
 
   Preferences g_settingsPrefs;
   bool g_settingsPrefsReady = false;
@@ -119,6 +133,8 @@ namespace
 
   String g_deviceId;
   String g_userId;
+  String g_environment;
+  String g_awsRegion;
   String g_macAddress;
   SystemState g_state = SystemState::WIFI_DISCONNECTED;
 
@@ -153,6 +169,81 @@ namespace
   bool g_hwWatchdogEnabled = false;
   unsigned long lastHeartbeatMs = 0;
   const unsigned long HEARTBEAT_INTERVAL = 60000; // 60s
+  String g_rootCaPath;
+  String g_deviceCertPath;
+  String g_privateKeyPath;
+
+  String toArduino(const std::string &value)
+  {
+    return value.empty() ? String() : String(value.c_str());
+  }
+
+  void seedConfigDefaults()
+  {
+    if (!Config::exists("aws", kAwsEndpointKey))
+    {
+      Config::setString("aws", kAwsEndpointKey, std::string(kDefaultAwsEndpoint));
+    }
+    if (!Config::exists("aws", kAwsRegionKey))
+    {
+      Config::setString("aws", kAwsRegionKey, std::string(kDefaultAwsRegion));
+    }
+    if (!Config::exists("aws", kAwsThingKey))
+    {
+      Config::setString("aws", kAwsThingKey, std::string(kDefaultThingName));
+    }
+    if (!Config::exists("aws", kAwsPortKey))
+    {
+      Config::setInt("aws", kAwsPortKey, kDefaultAwsPort);
+    }
+    if (!Config::exists("device", kDeviceEnvKey))
+    {
+      Config::setString("device", kDeviceEnvKey, std::string(kDefaultEnv));
+    }
+    if (!Config::exists("certs", kCertRootKey))
+    {
+      Config::setString("certs", kCertRootKey, std::string(kDefaultRootCaPath));
+    }
+    if (!Config::exists("certs", kCertDeviceKey))
+    {
+      Config::setString("certs", kCertDeviceKey, std::string(kDefaultDeviceCertPath));
+    }
+    if (!Config::exists("certs", kCertPrivateKey))
+    {
+      Config::setString("certs", kCertPrivateKey, std::string(kDefaultPrivateKeyPath));
+    }
+    if (!Config::exists("diag", kDiagWifiKey))
+    {
+      Config::setInt("diag", kDiagWifiKey, 0);
+    }
+    if (!Config::exists("diag", kDiagMqttKey))
+    {
+      Config::setInt("diag", kDiagMqttKey, 0);
+    }
+    if (!Config::exists("diag", kDiagResetKey))
+    {
+      Config::setInt("diag", kDiagResetKey, 0);
+    }
+  }
+
+  void incrementDiagCounter(const char *key)
+  {
+    const int32_t current = Config::getInt("diag", key, 0);
+    Config::setInt("diag", key, current + 1);
+  }
+
+  bool loadWifiCredentials(String &ssid, String &password)
+  {
+    ssid = toArduino(Config::getString("wifi", kWifiSsidKey, ""));
+    password = toArduino(Config::getString("wifi", kWifiPassKey, ""));
+    return ssid.length() > 0;
+  }
+
+  void updateDownlinkTopics()
+  {
+    g_downlinkSettingsTopic = String(TOPIC_BASE) + g_deviceId + "/downlink/settings";
+    g_downlinkSetpointsTopic = String(TOPIC_BASE) + g_deviceId + "/downlink/setpoints";
+  }
 
   // ========================== LOGGING
   void logWithDeviceId(const char *fmt, ...)
@@ -500,6 +591,7 @@ namespace
 
   void scheduleAwsBackoff(const char *reason)
   {
+    incrementDiagCounter(kDiagMqttKey);
     const uint32_t delayMs = g_currentAwsBackoffMs;
     logWithDeviceId("[MQTT] Reintento por %s en %lu ms\n",
                     reason ? reason : "reintento",
@@ -576,93 +668,114 @@ namespace
   }
 
   bool setupAWS()
+{
+  if (g_awsCredentialsLoaded && g_mqttClient)
   {
-    if (g_awsCredentialsLoaded && g_mqttClient)
-    {
-      return true;
-    }
-
-    if (!g_spiffsReady)
-    {
-      Serial.println("[AWS] ❌ SPIFFS no montado");
-      return false;
-    }
-
-    if (!SPIFFS.exists(ROOT_CA_PATH) || !SPIFFS.exists(CERT_PATH) || !SPIFFS.exists(KEY_PATH))
-    {
-      Serial.println("[AWS] ❌ Certificados no encontrados en SPIFFS");
-      clearAwsCredentials();
-      return false;
-    }
-
-    File ca = SPIFFS.open(ROOT_CA_PATH, "r");
-    File cert = SPIFFS.open(CERT_PATH, "r");
-    File key = SPIFFS.open(KEY_PATH, "r");
-
-    if (!ca || !cert || !key)
-    {
-      Serial.println("[AWS] ❌ No se pudieron abrir los certificados");
-      if (ca)
-        ca.close();
-      if (cert)
-        cert.close();
-      if (key)
-        key.close();
-      clearAwsCredentials();
-      return false;
-    }
-
-    g_rootCaPem = ca.readString();
-    g_deviceCertPem = cert.readString();
-    g_privateKeyPem = key.readString();
-
-    ca.close();
-    cert.close();
-    key.close();
-
-    if (g_rootCaPem.length() == 0 || g_deviceCertPem.length() == 0 || g_privateKeyPem.length() == 0)
-    {
-      Serial.println("[AWS] ❌ Certificados vacios o corruptos");
-      clearAwsCredentials();
-      return false;
-    }
-
-    if (g_mqttClient)
-    {
-      esp_mqtt_client_stop(g_mqttClient);
-      esp_mqtt_client_destroy(g_mqttClient);
-      g_mqttClient = nullptr;
-      g_mqttClientStarted = false;
-    }
-
-    esp_mqtt_client_config_t config = {};
-    config.host = AWS_IOT_ENDPOINT;
-    config.port = AWS_IOT_PORT;
-    config.client_id = g_deviceId.c_str();
-    config.transport = MQTT_TRANSPORT_OVER_SSL;
-    config.cert_pem = g_rootCaPem.c_str();
-    config.client_cert_pem = g_deviceCertPem.c_str();
-    config.client_key_pem = g_privateKeyPem.c_str();
-    config.buffer_size = 1024;
-    config.keepalive = kMqttKeepAliveSeconds;
-    config.event_handle = mqttEventHandler;
-
-    g_mqttClient = esp_mqtt_client_init(&config);
-    if (!g_mqttClient)
-    {
-      Serial.println("[AWS] ❌ No se pudo crear el cliente MQTT");
-      clearAwsCredentials();
-      return false;
-    }
-
-    g_awsCredentialsLoaded = true;
-    g_mqttClientStarted = false;
-    resetAwsBackoff();
-    logWithDeviceId("[AWS] Configuracion MQTT lista\n");
     return true;
   }
 
-  bool connectAWS()
+  if (!g_spiffsReady)
+  {
+    Serial.println("[AWS] ? SPIFFS no montado");
+    return false;
+  }
+
+  g_rootCaPath = toArduino(Config::getString("certs", kCertRootKey, kDefaultRootCaPath));
+  g_deviceCertPath = toArduino(Config::getString("certs", kCertDeviceKey, kDefaultDeviceCertPath));
+  g_privateKeyPath = toArduino(Config::getString("certs", kCertPrivateKey, kDefaultPrivateKeyPath));
+
+  if (!SPIFFS.exists(g_rootCaPath.c_str()) || !SPIFFS.exists(g_deviceCertPath.c_str()) ||
+      !SPIFFS.exists(g_privateKeyPath.c_str()))
+  {
+    Serial.println("[AWS] ? Certificados no encontrados en SPIFFS");
+    clearAwsCredentials();
+    return false;
+  }
+
+  File ca = SPIFFS.open(g_rootCaPath.c_str(), "r");
+  File cert = SPIFFS.open(g_deviceCertPath.c_str(), "r");
+  File key = SPIFFS.open(g_privateKeyPath.c_str(), "r");
+
+  if (!ca || !cert || !key)
+  {
+    Serial.println("[AWS] ? No se pudieron abrir los certificados");
+    if (ca)
+      ca.close();
+    if (cert)
+      cert.close();
+    if (key)
+      key.close();
+    clearAwsCredentials();
+    return false;
+  }
+
+  g_rootCaPem = ca.readString();
+  g_deviceCertPem = cert.readString();
+  g_privateKeyPem = key.readString();
+
+  ca.close();
+  cert.close();
+  key.close();
+
+  if (g_rootCaPem.length() == 0 || g_deviceCertPem.length() == 0 || g_privateKeyPem.length() == 0)
+  {
+    Serial.println("[AWS] ? Certificados vacios o corruptos");
+    clearAwsCredentials();
+    return false;
+  }
+
+  if (g_mqttClient)
+  {
+    esp_mqtt_client_stop(g_mqttClient);
+    esp_mqtt_client_destroy(g_mqttClient);
+    g_mqttClient = nullptr;
+    g_mqttClientStarted = false;
+  }
+
+  String endpoint = toArduino(Config::getString("aws", kAwsEndpointKey, kDefaultAwsEndpoint));
+  g_awsRegion = toArduino(Config::getString("aws", kAwsRegionKey, kDefaultAwsRegion));
+  String thingName =
+      toArduino(Config::getString("aws", kAwsThingKey, std::string(g_deviceId.c_str())));
+  if (thingName.isEmpty())
+  {
+    thingName = g_deviceId;
+  }
+  const int32_t awsPort = Config::getInt("aws", kAwsPortKey, kDefaultAwsPort);
+
+  if (endpoint.isEmpty())
+  {
+    Serial.println("[AWS] ? Endpoint no configurado");
+    return false;
+  }
+
+  esp_mqtt_client_config_t config = {};
+  config.host = endpoint.c_str();
+  config.port = static_cast<int>(awsPort);
+  config.client_id = thingName.c_str();
+  config.transport = MQTT_TRANSPORT_OVER_SSL;
+  config.cert_pem = g_rootCaPem.c_str();
+  config.client_cert_pem = g_deviceCertPem.c_str();
+  config.client_key_pem = g_privateKeyPem.c_str();
+  config.buffer_size = 1024;
+  config.keepalive = kMqttKeepAliveSeconds;
+  config.event_handle = mqttEventHandler;
+
+  g_mqttClient = esp_mqtt_client_init(&config);
+  if (!g_mqttClient)
+  {
+    Serial.println("[AWS] ? No se pudo crear el cliente MQTT");
+    clearAwsCredentials();
+    return false;
+  }
+
+  g_awsCredentialsLoaded = true;
+  g_mqttClientStarted = false;
+  resetAwsBackoff();
+  logWithDeviceId("[AWS] Configuracion MQTT lista\n");
+  return true;
+}
+
+bool connectAWS()
   {
     if (!g_awsCredentialsLoaded || !g_mqttClient)
     {
@@ -844,6 +957,7 @@ namespace
 
   void scheduleWifiReconnect(const char *reason)
   {
+    incrementDiagCounter(kDiagWifiKey);
     if (g_wifiBackoffIndex >= kWifiBackoffStepCount)
     {
       logWithDeviceId("[WIFI] Backoff maximo alcanzado, reiniciando...\n");
@@ -871,6 +985,8 @@ namespace
     g_wifiConnecting = false;
     applyWifiConnectionStatus(false);
     resetWifiBackoff();
+    Config::setString("wifi", kWifiSsidKey, std::string());
+    Config::setString("wifi", kWifiPassKey, std::string());
     if (wasConnected)
     {
       Provisioning::notifyStatus("wifi:desconectado");
@@ -921,16 +1037,21 @@ namespace
 
     WiFi.disconnect(false, false);
 
-    if (ssid && password)
+    String connectSsid;
+    String connectPassword;
+    if (ssid && strlen(ssid) > 0)
     {
-      logWithDeviceId("[WIFI] Conectando a '%s'\n", ssid);
-      WiFi.begin(ssid, password);
+      connectSsid = ssid;
+      connectPassword = password ? String(password) : String();
     }
-    else
+    else if (!loadWifiCredentials(connectSsid, connectPassword))
     {
-      logWithDeviceId("[WIFI] Conectando con credenciales guardadas\n");
-      WiFi.begin();
+      logWithDeviceId("[WIFI] No hay credenciales configuradas\n");
+      return;
     }
+
+    logWithDeviceId("[WIFI] Conectando a '%s'\n", connectSsid.c_str());
+    WiFi.begin(connectSsid.c_str(), connectPassword.length() > 0 ? connectPassword.c_str() : nullptr);
 
     g_wifiConnecting = true;
     g_wifiConnectStart = millis();
@@ -938,59 +1059,30 @@ namespace
 
   bool hasStoredCredentials()
   {
-    wifi_config_t config;
-    if (esp_wifi_get_config(WIFI_IF_STA, &config) != ESP_OK)
-    {
-      return false;
-    }
-    return config.sta.ssid[0] != '\0';
-  }
-
-  bool beginIdentityPrefs()
-  {
-    if (g_identityPrefsReady)
-    {
-      return true;
-    }
-
-    g_identityPrefsReady = g_identityPrefs.begin(kPrefsNamespace, false);
-    if (!g_identityPrefsReady)
-    {
-      Serial.println("[identity] No se pudieron abrir las preferencias");
-    }
-    return g_identityPrefsReady;
+    String ssid;
+    String password;
+    return loadWifiCredentials(ssid, password);
   }
 
   void persistDeviceId()
   {
-    if (!beginIdentityPrefs())
+    Config::setString("device", kDeviceIdKey, std::string(g_deviceId.c_str()));
+    if (!Config::exists("aws", kAwsThingKey) ||
+        Config::getString("aws", kAwsThingKey, "").empty())
     {
-      return;
+      Config::setString("aws", kAwsThingKey, std::string(g_deviceId.c_str()));
     }
-
-    g_identityPrefs.putString(kPrefsDeviceIdKey, g_deviceId);
   }
 
   void loadStoredUserId()
   {
-    if (!beginIdentityPrefs())
-    {
-      g_userId = "";
-      return;
-    }
-
-    g_userId = g_identityPrefs.getString(kPrefsUserIdKey, "");
+    g_userId = toArduino(Config::getString("device", kDeviceUserKey, ""));
   }
 
   void storeUserId(const String &userId)
   {
-    if (!beginIdentityPrefs())
-    {
-      return;
-    }
-
     g_userId = userId;
-    g_identityPrefs.putString(kPrefsUserIdKey, g_userId);
+    Config::setString("device", kDeviceUserKey, std::string(g_userId.c_str()));
   }
 
   void scheduleIdentityLog()
@@ -1038,18 +1130,67 @@ namespace
     return id;
   }
 
-  void onProvisionedCredentials(const String &ssid, const String &password, const String &userId)
+  void ensureDeviceIdentity()
   {
-    logWithDeviceId("[BLE] Credenciales recibidas para SSID '%s'\n", ssid.c_str());
+    const std::string storedId = Config::getString("device", kDeviceIdKey, "");
+    if (!storedId.empty())
+    {
+      g_deviceId = storedId.c_str();
+    }
+    else
+    {
+      g_deviceId = buildDeviceId();
+      persistDeviceId();
+    }
+    g_environment = toArduino(Config::getString("device", kDeviceEnvKey, kDefaultEnv));
+  }
+
+  void onProvisionedCredentials(const Provisioning::CredentialsData &creds)
+  {
+    logWithDeviceId("[BLE] Credenciales recibidas para SSID '%s'\n", creds.ssid.c_str());
+    Config::setString("wifi", kWifiSsidKey, std::string(creds.ssid.c_str()));
+    Config::setString("wifi", kWifiPassKey, std::string(creds.password.c_str()));
+
+    if (creds.deviceId.length() > 0 && creds.deviceId != g_deviceId)
+    {
+      g_deviceId = creds.deviceId;
+      persistDeviceId();
+      updateDownlinkTopics();
+      Provisioning::begin(g_deviceId, onProvisionedCredentials);
+    }
+
+    if (creds.endpoint.length() > 0)
+    {
+      Config::setString("aws", kAwsEndpointKey, std::string(creds.endpoint.c_str()));
+    }
+    if (creds.region.length() > 0)
+    {
+      Config::setString("aws", kAwsRegionKey, std::string(creds.region.c_str()));
+      g_awsRegion = creds.region;
+    }
+    if (creds.environment.length() > 0)
+    {
+      Config::setString("device", kDeviceEnvKey, std::string(creds.environment.c_str()));
+      g_environment = creds.environment;
+    }
+    if (creds.thingName.length() > 0)
+    {
+      Config::setString("aws", kAwsThingKey, std::string(creds.thingName.c_str()));
+    }
+    if (creds.awsPort > 0)
+    {
+      Config::setInt("aws", kAwsPortKey, creds.awsPort);
+    }
+
     Provisioning::notifyStatus("wifi:conectando");
     applyWifiConnectionStatus(false);
-    startWifiConnection(ssid.c_str(), password.c_str(), true);
+    startWifiConnection(creds.ssid.c_str(), creds.password.c_str(), true);
 
-    if (userId.length() > 0)
+    if (creds.userId.length() > 0)
     {
-      storeUserId(userId);
+      storeUserId(creds.userId);
       scheduleIdentityLog();
-      logWithDeviceId("[BLE] user_id recibido: %s\n", userId.c_str());
+      logWithDeviceId("[BLE] user_id recibido: %s\n", creds.userId.c_str());
     }
 
     g_claimPending = true;
@@ -1313,6 +1454,7 @@ namespace
   void logWatchdogResetIfNeeded()
   {
     const esp_reset_reason_t reason = esp_reset_reason();
+    Config::setInt("diag", kDiagResetKey, static_cast<int32_t>(reason));
     if (reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT)
     {
       logWithDeviceId("[WATCHDOG] *** reset detected ***\n");
@@ -1324,6 +1466,8 @@ namespace
 void setup()
 {
   Serial.begin(115200);
+  Config::init();
+  seedConfigDefaults();
   logWatchdogResetIfNeeded();
 
   g_spiffsReady = SPIFFS.begin(false);
@@ -1349,13 +1493,12 @@ void setup()
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
 
-  g_deviceId = buildDeviceId();
-  persistDeviceId();
+  ensureDeviceIdentity();
   loadStoredUserId();
   scheduleIdentityLog();
   logWithDeviceId("[BOOT] device_id: %s\n", g_deviceId.c_str());
-  g_downlinkSettingsTopic = String(TOPIC_BASE) + g_deviceId + "/downlink/settings";
-  g_downlinkSetpointsTopic = String(TOPIC_BASE) + g_deviceId + "/downlink/setpoints";
+  logWithDeviceId("[BOOT] entorno: %s\n", g_environment.c_str());
+  updateDownlinkTopics();
   loadSettingsFromPrefs();
   loadSetpointsFromPrefs();
 
@@ -1406,3 +1549,4 @@ void loop()
 
   delay(1);
 }
+

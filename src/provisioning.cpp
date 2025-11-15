@@ -7,12 +7,14 @@
 #include <BLEUtils.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 
 namespace Provisioning {
 namespace {
@@ -31,17 +33,15 @@ bool g_centralConnected = false;
 uint16_t g_connId = kInvalidConnId;
 volatile bool g_restartAdvertising = false;
 
-constexpr size_t kProvisioningQueueLength = 6;
 constexpr size_t kMaxNotifyLength = 64;
 constexpr size_t kMaxSsidLength = 33;    // 32 + null
 constexpr size_t kMaxPasswordLength = 65; // 64 + null (WPA2 max)
 constexpr size_t kMaxUserIdLength = 65;  // accommodate UUID or custom id
-
-enum class ProvisioningEventType : uint8_t
-{
-  Notify = 0,
-  Credentials,
-};
+constexpr size_t kMaxDeviceIdLength = 65;
+constexpr size_t kMaxEndpointLength = 129;
+constexpr size_t kMaxRegionLength = 33;
+constexpr size_t kMaxEnvLength = 17;
+constexpr size_t kMaxThingNameLength = 65;
 
 struct NotifyPayload
 {
@@ -53,25 +53,31 @@ struct CredentialsPayload
   char ssid[kMaxSsidLength];
   char password[kMaxPasswordLength];
   char userId[kMaxUserIdLength];
+  char deviceId[kMaxDeviceIdLength];
+  char endpoint[kMaxEndpointLength];
+  char region[kMaxRegionLength];
+  char environment[kMaxEnvLength];
+  char thingName[kMaxThingNameLength];
+  int32_t awsPort;
 };
 
-struct ProvisioningEvent
-{
-  ProvisioningEventType type;
-  union
-  {
-    NotifyPayload notify;
-    CredentialsPayload credentials;
-  } data;
-};
-
-QueueHandle_t g_eventQueue = nullptr;
+portMUX_TYPE g_queueMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool g_pendingNotify = false;
+volatile bool g_pendingCredentials = false;
+NotifyPayload g_notifyBuffer = {};
+CredentialsPayload g_credentialsBuffer = {};
 
 struct ParsedCredentials {
   bool valid = false;
   String ssid;
   String password;
   String userId;
+  String deviceId;
+  String endpoint;
+  String region;
+  String environment;
+  String thingName;
+  int32_t awsPort = 0;
   String error;
 };
 
@@ -88,6 +94,20 @@ void trim(std::string &text) {
   }
 }
 
+std::vector<std::string> splitTokens(const std::string &payload) {
+  std::vector<std::string> tokens;
+  size_t start = 0;
+  while (start < payload.size()) {
+    size_t end = payload.find('\n', start);
+    if (end == std::string::npos) {
+      end = payload.size();
+    }
+    tokens.emplace_back(payload.substr(start, end - start));
+    start = end + 1;
+  }
+  return tokens;
+}
+
 ParsedCredentials parseCredentials(const std::string &raw) {
   ParsedCredentials result;
   if (raw.empty()) {
@@ -97,55 +117,99 @@ ParsedCredentials parseCredentials(const std::string &raw) {
 
   std::string payload = raw;
   payload.erase(std::remove(payload.begin(), payload.end(), '\r'), payload.end());
+  std::replace(payload.begin(), payload.end(), '|', '\n');
 
-  size_t firstSeparator = payload.find('\n');
-  char separatorChar = '\n';
-  if (firstSeparator == std::string::npos) {
-    firstSeparator = payload.find('|');
-    separatorChar = '|';
-  }
+  const bool keyValueMode = payload.find('=') != std::string::npos;
+  std::vector<std::string> tokens = splitTokens(payload);
 
-  if (firstSeparator == std::string::npos) {
-    result.error = "formato";
-    return result;
-  }
+  if (keyValueMode) {
+    for (std::string token : tokens) {
+      trim(token);
+      if (token.empty()) {
+        continue;
+      }
+      size_t eq = token.find('=');
+      if (eq == std::string::npos) {
+        continue;
+      }
 
-  std::string ssid(payload.begin(), payload.begin() + firstSeparator);
+      std::string key(token.begin(), token.begin() + eq);
+      std::string value(token.begin() + eq + 1, token.end());
+      trim(key);
+      trim(value);
+      if (key.empty()) {
+        continue;
+      }
+      std::transform(key.begin(), key.end(), key.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      String valueStr(value.c_str());
 
-  size_t secondSeparator = payload.find(separatorChar, firstSeparator + 1);
-  std::string password;
-  std::string userId;
-  if (secondSeparator == std::string::npos) {
-    password.assign(payload.begin() + firstSeparator + 1, payload.end());
+      if (key == "ssid" || key == "wifi_ssid") {
+        result.ssid = valueStr;
+      } else if (key == "password" || key == "pass" || key == "wifi_password") {
+        result.password = valueStr;
+      } else if (key == "user_id" || key == "userid") {
+        result.userId = valueStr;
+      } else if (key == "device_id") {
+        result.deviceId = valueStr;
+      } else if (key == "endpoint" || key == "aws_endpoint") {
+        result.endpoint = valueStr;
+      } else if (key == "region" || key == "aws_region") {
+        result.region = valueStr;
+      } else if (key == "env" || key == "environment") {
+        result.environment = valueStr;
+      } else if (key == "thing" || key == "thingname" || key == "thing_name") {
+        result.thingName = valueStr;
+      } else if (key == "aws_port" || key == "port") {
+        result.awsPort = atoi(value.c_str());
+      }
+    }
   } else {
-    password.assign(payload.begin() + firstSeparator + 1,
-                    payload.begin() + secondSeparator);
-    userId.assign(payload.begin() + secondSeparator + 1, payload.end());
+    if (!tokens.empty()) {
+      std::string ssid(tokens[0]);
+      trim(ssid);
+      result.ssid = String(ssid.c_str());
+    }
+    if (tokens.size() > 1) {
+      std::string password(tokens[1]);
+      trim(password);
+      result.password = String(password.c_str());
+    }
+    if (tokens.size() > 2) {
+      std::string user(tokens[2]);
+      trim(user);
+      result.userId = String(user.c_str());
+    }
   }
 
-  trim(ssid);
-  trim(password);
-  trim(userId);
-
-  if (ssid.empty()) {
+  if (result.ssid.isEmpty()) {
     result.error = "ssid";
     return result;
   }
 
   result.valid = true;
-  result.ssid = String(ssid.c_str());
-  result.password = String(password.c_str());
-  result.userId = String(userId.c_str());
   return result;
 }
 
-void enqueueEvent(const ProvisioningEvent &event)
+void queueNotify(const char *message)
 {
-  if (!g_eventQueue)
+  if (!message)
   {
     return;
   }
-  xQueueSend(g_eventQueue, &event, 0);
+  portENTER_CRITICAL(&g_queueMux);
+  strncpy(g_notifyBuffer.message, message, sizeof(g_notifyBuffer.message) - 1);
+  g_notifyBuffer.message[sizeof(g_notifyBuffer.message) - 1] = '\0';
+  g_pendingNotify = true;
+  portEXIT_CRITICAL(&g_queueMux);
+}
+
+void queueCredentials(const CredentialsPayload &payload)
+{
+  portENTER_CRITICAL(&g_queueMux);
+  g_credentialsBuffer = payload;
+  g_pendingCredentials = true;
+  portEXIT_CRITICAL(&g_queueMux);
 }
 
 void notify(const String &message) {
@@ -164,42 +228,25 @@ class ProvisioningCallbacks : public BLECharacteristicCallbacks {
     ParsedCredentials credentials = parseCredentials(value);
 
     if (!credentials.valid) {
-      ProvisioningEvent errorEvent;
-      errorEvent.type = ProvisioningEventType::Notify;
-      snprintf(errorEvent.data.notify.message,
-               sizeof(errorEvent.data.notify.message),
-               "error:%s", credentials.error.c_str());
-      enqueueEvent(errorEvent);
+      char message[kMaxNotifyLength];
+      snprintf(message, sizeof(message), "error:%s", credentials.error.c_str());
+      queueNotify(message);
       return;
     }
 
-    ProvisioningEvent ackEvent;
-    ackEvent.type = ProvisioningEventType::Notify;
-    snprintf(ackEvent.data.notify.message,
-             sizeof(ackEvent.data.notify.message),
-             "credenciales");
-    enqueueEvent(ackEvent);
+    queueNotify("credenciales");
 
-    ProvisioningEvent credEvent;
-    credEvent.type = ProvisioningEventType::Credentials;
-    snprintf(credEvent.data.credentials.ssid,
-             sizeof(credEvent.data.credentials.ssid),
-             "%s", credentials.ssid.c_str());
-    snprintf(credEvent.data.credentials.password,
-             sizeof(credEvent.data.credentials.password),
-             "%s", credentials.password.c_str());
-    snprintf(credEvent.data.credentials.userId,
-             sizeof(credEvent.data.credentials.userId),
-             "%s", credentials.userId.c_str());
-
-    if (xQueueSend(g_eventQueue, &credEvent, 0) != pdTRUE) {
-      ProvisioningEvent queueErrorEvent;
-      queueErrorEvent.type = ProvisioningEventType::Notify;
-      snprintf(queueErrorEvent.data.notify.message,
-               sizeof(queueErrorEvent.data.notify.message),
-               "error:cola");
-      enqueueEvent(queueErrorEvent);
-    }
+    CredentialsPayload payload = {};
+    snprintf(payload.ssid, sizeof(payload.ssid), "%s", credentials.ssid.c_str());
+    snprintf(payload.password, sizeof(payload.password), "%s", credentials.password.c_str());
+    snprintf(payload.userId, sizeof(payload.userId), "%s", credentials.userId.c_str());
+    snprintf(payload.deviceId, sizeof(payload.deviceId), "%s", credentials.deviceId.c_str());
+    snprintf(payload.endpoint, sizeof(payload.endpoint), "%s", credentials.endpoint.c_str());
+    snprintf(payload.region, sizeof(payload.region), "%s", credentials.region.c_str());
+    snprintf(payload.environment, sizeof(payload.environment), "%s", credentials.environment.c_str());
+    snprintf(payload.thingName, sizeof(payload.thingName), "%s", credentials.thingName.c_str());
+    payload.awsPort = credentials.awsPort;
+    queueCredentials(payload);
   }
 };
 
@@ -246,11 +293,6 @@ void ensureInitialized(const String &deviceId) {
 
   g_deviceId = deviceId;
   BLEDevice::init(g_deviceId.c_str());
-
-  if (!g_eventQueue)
-  {
-    g_eventQueue = xQueueCreate(kProvisioningQueueLength, sizeof(ProvisioningEvent));
-  }
 
   g_server = BLEDevice::createServer();
   g_server->setCallbacks(new ServerCallbacks());
@@ -318,33 +360,45 @@ bool isActive() { return g_sessionActive; }
 void notifyStatus(const String &message) { notify(message); }
 
 void loop() {
-  if (g_eventQueue)
+  if (g_pendingNotify)
   {
-    ProvisioningEvent event;
-    while (xQueueReceive(g_eventQueue, &event, 0) == pdTRUE)
+    NotifyPayload payload = {};
+    portENTER_CRITICAL(&g_queueMux);
+    if (g_pendingNotify)
     {
-      switch (event.type)
-      {
-      case ProvisioningEventType::Notify:
-      {
-        String message(event.data.notify.message);
-        notify(message);
-        break;
-      }
-      case ProvisioningEventType::Credentials:
-      {
-        if (g_callback)
-        {
-          String ssid(event.data.credentials.ssid);
-          String password(event.data.credentials.password);
-          String userId(event.data.credentials.userId);
-          g_callback(ssid, password, userId);
-        }
-        break;
-      }
-      default:
-        break;
-      }
+      payload = g_notifyBuffer;
+      g_pendingNotify = false;
+    }
+    portEXIT_CRITICAL(&g_queueMux);
+    if (payload.message[0])
+    {
+      notify(String(payload.message));
+    }
+  }
+
+  if (g_pendingCredentials && g_callback)
+  {
+    CredentialsPayload payload = {};
+    portENTER_CRITICAL(&g_queueMux);
+    if (g_pendingCredentials)
+    {
+      payload = g_credentialsBuffer;
+      g_pendingCredentials = false;
+    }
+    portEXIT_CRITICAL(&g_queueMux);
+    if (payload.ssid[0])
+    {
+      CredentialsData data;
+      data.ssid = String(payload.ssid);
+      data.password = String(payload.password);
+      data.userId = String(payload.userId);
+      data.deviceId = String(payload.deviceId);
+      data.endpoint = String(payload.endpoint);
+      data.region = String(payload.region);
+      data.environment = String(payload.environment);
+      data.thingName = String(payload.thingName);
+      data.awsPort = payload.awsPort;
+      g_callback(data);
     }
   }
 

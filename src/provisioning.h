@@ -5,8 +5,20 @@
 #include <functional>
 
 namespace Provisioning {
-using CredentialsCallback =
-    std::function<void(const String &, const String &, const String &)>;
+struct CredentialsData
+{
+  String ssid;
+  String password;
+  String userId;
+  String deviceId;
+  String endpoint;
+  String region;
+  String environment;
+  String thingName;
+  int32_t awsPort = 0;
+};
+
+using CredentialsCallback = std::function<void(const CredentialsData &)>;
 
 void begin(const String &deviceId, CredentialsCallback callback);
 
