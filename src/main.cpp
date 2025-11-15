@@ -46,8 +46,9 @@ namespace
   constexpr uint32_t kButtonDebounceMs = 200;
   constexpr uint32_t kBleActivationHoldMs = 3000;
   constexpr uint32_t kIdentityLogDelayMs = 6000;
-  constexpr uint32_t kAwsReconnectDelayMs = 5000;
   constexpr uint16_t kMqttKeepAliveSeconds = 15;
+  constexpr uint32_t kAwsBackoffInitialMs = 1000;
+  constexpr uint32_t kAwsBackoffMaxMs = 16000;
   constexpr uint32_t kTaskWatchdogTimeoutSeconds = 8;
   constexpr uint32_t kHardwareWatchdogTimeoutMs = 12000;
   constexpr uint32_t kHardwareWatchdogPrescaler = 8000;
@@ -130,7 +131,8 @@ namespace
 
   // ===== AWS Flags
   bool g_awsConnected = false;
-  uint32_t g_lastAwsAttempt = 0;
+  uint32_t g_nextAwsAttemptMs = 0;
+  uint32_t g_currentAwsBackoffMs = kAwsBackoffInitialMs;
   bool g_claimPending = false;
   bool g_awsCredentialsLoaded = false;
   bool g_spiffsReady = false;
@@ -475,6 +477,28 @@ namespace
     g_rootCaPem = "";
     g_deviceCertPem = "";
     g_privateKeyPem = "";
+    g_nextAwsAttemptMs = 0;
+    g_currentAwsBackoffMs = kAwsBackoffInitialMs;
+  }
+
+  void resetAwsBackoff()
+  {
+    g_currentAwsBackoffMs = kAwsBackoffInitialMs;
+    g_nextAwsAttemptMs = 0;
+  }
+
+  void scheduleAwsBackoff(const char *reason)
+  {
+    const uint32_t delayMs = g_currentAwsBackoffMs;
+    logWithDeviceId("[MQTT] Reintento por %s en %lu ms\n",
+                    reason ? reason : "reintento",
+                    static_cast<unsigned long>(delayMs));
+    g_nextAwsAttemptMs = millis() + delayMs;
+    if (g_currentAwsBackoffMs < kAwsBackoffMaxMs)
+    {
+      const uint32_t doubled = g_currentAwsBackoffMs * 2;
+      g_currentAwsBackoffMs = doubled > kAwsBackoffMaxMs ? kAwsBackoffMaxMs : doubled;
+    }
   }
 
   esp_err_t mqttEventHandler(esp_mqtt_event_handle_t event)
@@ -488,7 +512,7 @@ namespace
     {
     case MQTT_EVENT_CONNECTED:
       g_awsConnected = true;
-      g_lastAwsAttempt = millis();
+      resetAwsBackoff();
       logWithDeviceId("[MQTT] Conectado\n");
       if (g_downlinkSettingsTopic.length() > 0)
       {
@@ -518,6 +542,7 @@ namespace
     case MQTT_EVENT_DISCONNECTED:
       g_awsConnected = false;
       logWithDeviceId("[MQTT] Desconectado\n");
+      scheduleAwsBackoff("desconexion");
       break;
     case MQTT_EVENT_DATA:
     {
@@ -621,6 +646,7 @@ namespace
 
     g_awsCredentialsLoaded = true;
     g_mqttClientStarted = false;
+    resetAwsBackoff();
     logWithDeviceId("[AWS] Configuracion MQTT lista\n");
     return true;
   }
@@ -634,11 +660,10 @@ namespace
     }
 
     const uint32_t now = millis();
-    if (now - g_lastAwsAttempt < kAwsReconnectDelayMs)
+    if (g_nextAwsAttemptMs != 0 && now < g_nextAwsAttemptMs)
     {
       return false;
     }
-    g_lastAwsAttempt = now;
 
     if (!g_mqttClientStarted)
     {
@@ -647,9 +672,11 @@ namespace
       {
         Serial.println("listo");
         g_mqttClientStarted = true;
+        g_nextAwsAttemptMs = millis() + g_currentAwsBackoffMs;
         return true;
       }
       Serial.println("fallo");
+      scheduleAwsBackoff("inicio fallido");
       return false;
     }
 
@@ -657,10 +684,12 @@ namespace
     if (err == ESP_OK)
     {
       Serial.println("[AWS] Reintentando conexion MQTT");
+      g_nextAwsAttemptMs = millis() + g_currentAwsBackoffMs;
       return true;
     }
 
     logWithDeviceId("[AWS] Error al reintentar MQTT (%d)\n", static_cast<int>(err));
+    scheduleAwsBackoff("error reconectar");
     return false;
   }
 
@@ -705,6 +734,7 @@ namespace
     if (!g_wifiConnected || !g_awsCredentialsLoaded || !mqttClient)
     {
       g_awsConnected = false;
+      resetAwsBackoff();
       return;
     }
 
