@@ -44,9 +44,11 @@ constexpr const char kDefaultEnv[] = "prod";
 constexpr const char kDefaultRootCaPath[] = "/certs/AmazonRootCA1.pem";
 constexpr const char kDefaultDeviceCertPath[] = "/certs/device.pem.crt";
 constexpr const char kDefaultPrivateKeyPath[] = "/certs/private.pem.key";
-constexpr const char kDiagWifiKey[] = "wifi_fail";
-constexpr const char kDiagMqttKey[] = "mqtt_fail";
-constexpr const char kDiagResetKey[] = "last_reset";
+constexpr const char kDiagWifiRetriesKey[] = "wifi_retries";
+constexpr const char kDiagMqttRetriesKey[] = "mqtt_retries";
+constexpr const char kDiagLastResetKey[] = "last_reset_reason";
+constexpr const char kDiagResetCountKey[] = "reset_count_total";
+constexpr const char kDiagWdtKey[] = "wdt_resets";
 constexpr const char kCertRootKey[] = "root_ca";
 constexpr const char kCertDeviceKey[] = "device_cert";
 constexpr const char kCertPrivateKey[] = "private_key";
@@ -212,17 +214,25 @@ namespace
     {
       Config::setString("certs", kCertPrivateKey, std::string(kDefaultPrivateKeyPath));
     }
-    if (!Config::exists("diag", kDiagWifiKey))
+    if (!Config::exists("diag", kDiagWifiRetriesKey))
     {
-      Config::setInt("diag", kDiagWifiKey, 0);
+      Config::setInt("diag", kDiagWifiRetriesKey, 0);
     }
-    if (!Config::exists("diag", kDiagMqttKey))
+    if (!Config::exists("diag", kDiagMqttRetriesKey))
     {
-      Config::setInt("diag", kDiagMqttKey, 0);
+      Config::setInt("diag", kDiagMqttRetriesKey, 0);
     }
-    if (!Config::exists("diag", kDiagResetKey))
+    if (!Config::exists("diag", kDiagLastResetKey))
     {
-      Config::setInt("diag", kDiagResetKey, 0);
+      Config::setInt("diag", kDiagLastResetKey, 0);
+    }
+    if (!Config::exists("diag", kDiagResetCountKey))
+    {
+      Config::setInt("diag", kDiagResetCountKey, 0);
+    }
+    if (!Config::exists("diag", kDiagWdtKey))
+    {
+      Config::setInt("diag", kDiagWdtKey, 0);
     }
   }
 
@@ -591,7 +601,7 @@ namespace
 
   void scheduleAwsBackoff(const char *reason)
   {
-    incrementDiagCounter(kDiagMqttKey);
+    incrementDiagCounter(kDiagMqttRetriesKey);
     const uint32_t delayMs = g_currentAwsBackoffMs;
     logWithDeviceId("[MQTT] Reintento por %s en %lu ms\n",
                     reason ? reason : "reintento",
@@ -957,7 +967,7 @@ bool connectAWS()
 
   void scheduleWifiReconnect(const char *reason)
   {
-    incrementDiagCounter(kDiagWifiKey);
+    incrementDiagCounter(kDiagWifiRetriesKey);
     if (g_wifiBackoffIndex >= kWifiBackoffStepCount)
     {
       logWithDeviceId("[WIFI] Backoff maximo alcanzado, reiniciando...\n");
@@ -1451,10 +1461,20 @@ bool connectAWS()
     disableHardwareWatchdog();
   }
 
+  void recordResetInfo()
+  {
+    const esp_reset_reason_t reason = esp_reset_reason();
+    Config::setInt("diag", kDiagLastResetKey, static_cast<int32_t>(reason));
+    incrementDiagCounter(kDiagResetCountKey);
+    if (reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT)
+    {
+      incrementDiagCounter(kDiagWdtKey);
+    }
+  }
+
   void logWatchdogResetIfNeeded()
   {
     const esp_reset_reason_t reason = esp_reset_reason();
-    Config::setInt("diag", kDiagResetKey, static_cast<int32_t>(reason));
     if (reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT)
     {
       logWithDeviceId("[WATCHDOG] *** reset detected ***\n");
@@ -1468,6 +1488,7 @@ void setup()
   Serial.begin(115200);
   Config::init();
   seedConfigDefaults();
+  recordResetInfo();
   logWatchdogResetIfNeeded();
 
   g_spiffsReady = SPIFFS.begin(false);

@@ -17,6 +17,26 @@ namespace Config
 
     constexpr const char *kNamespaces[] = {"aws", "wifi", "device", "certs", "diag"};
 
+    struct LengthLimit
+    {
+      const char *ns;
+      const char *key;
+      size_t maxLen;
+    };
+
+    constexpr size_t kDefaultMaxLen = 512;
+    constexpr LengthLimit kLengthLimits[] = {
+        {"wifi", "ssid", 128},
+        {"wifi", "password", 128},
+        {"device", "device_id", 128},
+        {"device", "env", 64},
+        {"aws", "endpoint", 256},
+        {"aws", "thing", 128},
+        {"certs", "root_ca_path", 256},
+        {"certs", "device_cert_path", 256},
+        {"certs", "private_key_path", 256},
+    };
+
     bool hasLogged(const char *ns, const char *key)
     {
       const std::string token = std::string(ns ? ns : "") + "/" + (key ? key : "");
@@ -36,6 +56,49 @@ namespace Config
         return;
       }
       Serial.printf("[CONFIG] Clave faltante %s/%s\n", ns, key);
+    }
+
+    size_t maxAllowedLength(const char *ns, const char *key)
+    {
+      if (!ns || !key)
+      {
+        return kDefaultMaxLen;
+      }
+      for (const LengthLimit &entry : kLengthLimits)
+      {
+        if (strcmp(entry.ns, ns) == 0 && strcmp(entry.key, key) == 0)
+        {
+          return entry.maxLen;
+        }
+      }
+      return kDefaultMaxLen;
+    }
+
+    bool validateLength(const char *ns, const char *key, const std::string &value)
+    {
+      const size_t maxLen = maxAllowedLength(ns, key);
+      if (value.length() > maxLen)
+      {
+        Serial.printf("[CONFIG] Valor demasiado largo %s/%s (max %u)\n",
+                      ns,
+                      key,
+                      static_cast<unsigned>(maxLen));
+        return false;
+      }
+      return true;
+    }
+
+    bool shouldHideValue(const char *ns, const char *key)
+    {
+      if (!ns)
+      {
+        return false;
+      }
+      if (strcmp(ns, "wifi") == 0 || strcmp(ns, "device") == 0 || strcmp(ns, "aws") == 0)
+      {
+        return true;
+      }
+      return false;
     }
 
     esp_err_t ensureInit()
@@ -72,6 +135,11 @@ namespace Config
     if (err != ESP_OK)
     {
       return err;
+    }
+
+    if (!validateLength(ns, key, value))
+    {
+      return ESP_ERR_INVALID_SIZE;
     }
 
     nvs_handle_t handle;
@@ -280,7 +348,14 @@ namespace Config
               {
                 value.pop_back();
               }
-              Serial.printf("  %s = %s\n", info.key, value.c_str());
+              if (shouldHideValue(ns, info.key))
+              {
+                Serial.printf("  %s = (oculto)\n", info.key);
+              }
+              else
+              {
+                Serial.printf("  %s = %s\n", info.key, value.c_str());
+              }
             }
           }
           break;
