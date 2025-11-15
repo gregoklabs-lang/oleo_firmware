@@ -3,8 +3,9 @@
 #include <esp_wifi.h>
 #include <stdarg.h>
 #include <Preferences.h>
-#include <WiFiClientSecure.h>
-#include <PubSubClient.h>
+#include <esp_event.h>
+#include <esp_system.h>
+#include <mqtt_client.h>
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <SPIFFS.h>
@@ -30,8 +31,7 @@ const int AWS_IOT_PORT = 8883;
 #define CERT_PATH "/certs/device.pem.crt"
 #define KEY_PATH "/certs/private.pem.key"
 
-WiFiClientSecure net;
-PubSubClient mqttClient(net);
+esp_mqtt_client_handle_t mqttClient = nullptr;
 
 namespace
 {
@@ -42,6 +42,7 @@ namespace
   constexpr uint32_t kBleActivationHoldMs = 3000;
   constexpr uint32_t kIdentityLogDelayMs = 6000;
   constexpr uint32_t kAwsReconnectDelayMs = 5000;
+  constexpr uint16_t kMqttKeepAliveSeconds = 15;
 
   enum class SystemState : uint8_t
   {
@@ -125,6 +126,7 @@ namespace
   bool g_claimPending = false;
   bool g_awsCredentialsLoaded = false;
   bool g_spiffsReady = false;
+  bool g_mqttClientStarted = false;
   String g_rootCaPem;
   String g_deviceCertPem;
   String g_privateKeyPem;
@@ -401,7 +403,7 @@ namespace
     logStoredSetpoints("[SETPOINTS] ✅ Actualizados desde downlink:");
   }
 
-  void mqttCallback(char *topic, byte *payload, unsigned int length)
+  void mqttCallback(const char *topic, const uint8_t *payload, unsigned int length)
   {
     if (!topic)
     {
@@ -451,19 +453,92 @@ namespace
 
   void clearAwsCredentials()
   {
+    if (mqttClient)
+    {
+      esp_mqtt_client_stop(mqttClient);
+      esp_mqtt_client_destroy(mqttClient);
+      mqttClient = nullptr;
+    }
+    g_mqttClientStarted = false;
+    g_awsConnected = false;
+    g_awsCredentialsLoaded = false;
     g_rootCaPem = "";
     g_deviceCertPem = "";
     g_privateKeyPem = "";
-    g_awsCredentialsLoaded = false;
-    g_awsConnected = false;
+  }
+
+  esp_err_t mqttEventHandler(esp_mqtt_event_handle_t event)
+  {
+    if (!event)
+    {
+      return ESP_FAIL;
+    }
+
+    switch (event->event_id)
+    {
+    case MQTT_EVENT_CONNECTED:
+      g_awsConnected = true;
+      g_lastAwsAttempt = millis();
+      logWithDeviceId("[MQTT] Conectado\n");
+      if (g_downlinkSettingsTopic.length() > 0)
+      {
+        const int msgId = esp_mqtt_client_subscribe(event->client, g_downlinkSettingsTopic.c_str(), 1);
+        if (msgId >= 0)
+        {
+          logWithDeviceId("[MQTT] Suscrito a %s\n", g_downlinkSettingsTopic.c_str());
+        }
+        else
+        {
+          logWithDeviceId("[MQTT] ⚠️ Fallo al suscribir %s\n", g_downlinkSettingsTopic.c_str());
+        }
+      }
+      if (g_downlinkSetpointsTopic.length() > 0)
+      {
+        const int msgId = esp_mqtt_client_subscribe(event->client, g_downlinkSetpointsTopic.c_str(), 1);
+        if (msgId >= 0)
+        {
+          logWithDeviceId("[MQTT] Suscrito a %s\n", g_downlinkSetpointsTopic.c_str());
+        }
+        else
+        {
+          logWithDeviceId("[MQTT] ⚠️ Fallo al suscribir %s\n", g_downlinkSetpointsTopic.c_str());
+        }
+      }
+      break;
+    case MQTT_EVENT_DISCONNECTED:
+      g_awsConnected = false;
+      logWithDeviceId("[MQTT] Desconectado\n");
+      break;
+    case MQTT_EVENT_DATA:
+    {
+      if (!event->topic || event->topic_len == 0)
+      {
+        break;
+      }
+      String topicCopy(event->topic, event->topic_len);
+      mqttCallback(topicCopy.c_str(), reinterpret_cast<const uint8_t *>(event->data), event->data_len);
+      break;
+    }
+    case MQTT_EVENT_ERROR:
+      logWithDeviceId("[MQTT] Error en evento MQTT\n");
+      break;
+    default:
+      break;
+    }
+
+    return ESP_OK;
   }
 
   bool setupAWS()
   {
+    if (g_awsCredentialsLoaded && mqttClient)
+    {
+      return true;
+    }
+
     if (!g_spiffsReady)
     {
       Serial.println("[AWS] ❌ SPIFFS no montado");
-      clearAwsCredentials();
       return false;
     }
 
@@ -481,9 +556,12 @@ namespace
     if (!ca || !cert || !key)
     {
       Serial.println("[AWS] ❌ No se pudieron abrir los certificados");
-      if (ca) ca.close();
-      if (cert) cert.close();
-      if (key) key.close();
+      if (ca)
+        ca.close();
+      if (cert)
+        cert.close();
+      if (key)
+        key.close();
       clearAwsCredentials();
       return false;
     }
@@ -503,73 +581,82 @@ namespace
       return false;
     }
 
-    net.setCACert(g_rootCaPem.c_str());
-    net.setCertificate(g_deviceCertPem.c_str());
-    net.setPrivateKey(g_privateKeyPem.c_str());
+    if (mqttClient)
+    {
+      esp_mqtt_client_stop(mqttClient);
+      esp_mqtt_client_destroy(mqttClient);
+      mqttClient = nullptr;
+      g_mqttClientStarted = false;
+    }
 
-    mqttClient.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
-    mqttClient.setBufferSize(1024);
-    mqttClient.setCallback(mqttCallback);
+    esp_mqtt_client_config_t config = {};
+    config.host = AWS_IOT_ENDPOINT;
+    config.port = AWS_IOT_PORT;
+    config.client_id = g_deviceId.c_str();
+    config.transport = MQTT_TRANSPORT_OVER_SSL;
+    config.cert_pem = g_rootCaPem.c_str();
+    config.client_cert_pem = g_deviceCertPem.c_str();
+    config.client_key_pem = g_privateKeyPem.c_str();
+    config.buffer_size = 1024;
+    config.keepalive = kMqttKeepAliveSeconds;
+    config.event_handle = mqttEventHandler;
+
+    mqttClient = esp_mqtt_client_init(&config);
+    if (!mqttClient)
+    {
+      Serial.println("[AWS] ❌ No se pudo crear el cliente MQTT");
+      clearAwsCredentials();
+      return false;
+    }
+
     g_awsCredentialsLoaded = true;
+    g_mqttClientStarted = false;
     logWithDeviceId("[AWS] Configuracion MQTT lista\n");
     return true;
   }
 
   bool connectAWS()
   {
-    if (!g_awsCredentialsLoaded)
+    if (!g_awsCredentialsLoaded || !mqttClient)
     {
       g_awsConnected = false;
       return false;
     }
 
-    if (mqttClient.connected()) return true;
-
-    if (millis() - g_lastAwsAttempt < kAwsReconnectDelayMs) return false;
-    g_lastAwsAttempt = millis();
-
-    Serial.print("[AWS] 🔌 Conectando a IoT Core... ");
-    if (mqttClient.connect(g_deviceId.c_str()))
+    const uint32_t now = millis();
+    if (now - g_lastAwsAttempt < kAwsReconnectDelayMs)
     {
-      Serial.println("✅ Conectado");
-      const char *settingsTopic = g_downlinkSettingsTopic.c_str();
-      if (settingsTopic && settingsTopic[0] != '\0')
+      return false;
+    }
+    g_lastAwsAttempt = now;
+
+    if (!g_mqttClientStarted)
+    {
+      Serial.print("[AWS] 🔌 Iniciando cliente MQTT... ");
+      if (esp_mqtt_client_start(mqttClient) == ESP_OK)
       {
-        if (mqttClient.subscribe(settingsTopic))
-        {
-          logWithDeviceId("[MQTT] Suscrito a %s\n", settingsTopic);
-        }
-        else
-        {
-          logWithDeviceId("[MQTT] ⚠️ Fallo al suscribir %s\n", settingsTopic);
-        }
+        Serial.println("listo");
+        g_mqttClientStarted = true;
+        return true;
       }
-      const char *setpointsTopic = g_downlinkSetpointsTopic.c_str();
-      if (setpointsTopic && setpointsTopic[0] != '\0')
-      {
-        if (mqttClient.subscribe(setpointsTopic))
-        {
-          logWithDeviceId("[MQTT] Suscrito a %s\n", setpointsTopic);
-        }
-        else
-        {
-          logWithDeviceId("[MQTT] ⚠️ Fallo al suscribir %s\n", setpointsTopic);
-        }
-      }
-      g_awsConnected = true;
+      Serial.println("fallo");
+      return false;
+    }
+
+    esp_err_t err = esp_mqtt_client_reconnect(mqttClient);
+    if (err == ESP_OK)
+    {
+      Serial.println("[AWS] Reintentando conexion MQTT");
       return true;
     }
-    else
-    {
-      Serial.printf("❌ Falla MQTT rc=%d\n", mqttClient.state());
-      g_awsConnected = false;
-      return false;
-    }
+
+    logWithDeviceId("[AWS] Error al reintentar MQTT (%d)\n", static_cast<int>(err));
+    return false;
   }
 
   void sendProvisioningClaim()
   {
-    if (!g_claimPending || !mqttClient.connected())
+    if (!g_claimPending || !mqttClient || !g_awsConnected)
     {
       return;
     }
@@ -586,7 +673,13 @@ namespace
 
     logWithDeviceId("[AWS] Publicando claim -> %s\n", payload.c_str());
 
-    if (mqttClient.publish(topic.c_str(), payload.c_str()))
+    const int msgId = esp_mqtt_client_publish(mqttClient,
+                                              topic.c_str(),
+                                              payload.c_str(),
+                                              static_cast<int>(payload.length()),
+                                              1,
+                                              0);
+    if (msgId >= 0)
     {
       logWithDeviceId("[AWS] Mensaje MQTT enviado\n");
       g_claimPending = false;
@@ -599,33 +692,20 @@ namespace
 
   void handleAWS()
   {
-    if (!g_wifiConnected)
+    if (!g_wifiConnected || !g_awsCredentialsLoaded || !mqttClient)
     {
       g_awsConnected = false;
       return;
     }
 
-    if (!g_awsCredentialsLoaded)
+    if (!g_awsConnected)
     {
-      g_awsConnected = false;
+      connectAWS();
       return;
     }
 
-    if (!mqttClient.connected())
-    {
-      if (connectAWS())
-      {
-        sendProvisioningClaim();
-      }
-    }
-    else
-    {
-      mqttClient.loop();
-      sendProvisioningClaim();
-    }
+    sendProvisioningClaim();
   }
-
-  // ========================== (Tu código original sigue igual)
   String formatState(SystemState state)
   {
     switch (state)
