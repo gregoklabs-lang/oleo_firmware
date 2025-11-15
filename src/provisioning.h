@@ -15,6 +15,7 @@ struct CredentialsData
   String region;
   String environment;
   String thingName;
+  String provisionToken;
   int32_t awsPort = 0;
 };
 
@@ -27,6 +28,8 @@ bool startBle();
 void stopBle();
 
 bool isActive();
+
+bool isProvisioningAllowed();
 
 void notifyStatus(const String &message);
 

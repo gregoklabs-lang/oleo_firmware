@@ -16,6 +16,8 @@
 
 #include "freertos/FreeRTOS.h"
 
+#include "Config.hpp"
+
 namespace Provisioning {
 namespace {
 constexpr char kServiceUuid[] = "12345678-1234-1234-1234-1234567890ab";
@@ -32,6 +34,9 @@ bool g_sessionActive = false;
 bool g_centralConnected = false;
 uint16_t g_connId = kInvalidConnId;
 volatile bool g_restartAdvertising = false;
+bool g_bleDeviceInitialized = false;
+uint32_t g_bootMillis = 0;
+bool g_windowWarningLogged = false;
 
 constexpr size_t kMaxNotifyLength = 64;
 constexpr size_t kMaxSsidLength = 33;    // 32 + null
@@ -42,6 +47,9 @@ constexpr size_t kMaxEndpointLength = 129;
 constexpr size_t kMaxRegionLength = 33;
 constexpr size_t kMaxEnvLength = 17;
 constexpr size_t kMaxThingNameLength = 65;
+constexpr size_t kMaxProvisionTokenLength = 65;
+constexpr uint32_t kProvisioningWindowMs = 10UL * 60UL * 1000UL;
+constexpr int kProvisioningButtonPin = 0;
 
 struct NotifyPayload
 {
@@ -58,6 +66,7 @@ struct CredentialsPayload
   char region[kMaxRegionLength];
   char environment[kMaxEnvLength];
   char thingName[kMaxThingNameLength];
+  char provisionToken[kMaxProvisionTokenLength];
   int32_t awsPort;
 };
 
@@ -77,7 +86,9 @@ struct ParsedCredentials {
   String region;
   String environment;
   String thingName;
+  String provisionToken;
   int32_t awsPort = 0;
+  bool awsPortProvided = false;
   String error;
 };
 
@@ -106,6 +117,34 @@ std::vector<std::string> splitTokens(const std::string &payload) {
     start = end + 1;
   }
   return tokens;
+}
+
+bool isValidDeviceId(const String &id) {
+  if (id.isEmpty()) {
+    return true;
+  }
+  if (id.length() > 32) {
+    return false;
+  }
+  for (size_t i = 0; i < id.length(); ++i) {
+    const char c = id[i];
+    const bool allowed = (c >= '0' && c <= '9') ||
+                         (c >= 'a' && c <= 'z') ||
+                         (c >= 'A' && c <= 'Z') ||
+                         c == '-' || c == '_';
+    if (!allowed) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool isValidPort(int32_t port) {
+  return port > 0 && port < 65536;
+}
+
+bool isValidLength(const String &value, size_t maxLen) {
+  return value.length() <= maxLen;
 }
 
 ParsedCredentials parseCredentials(const std::string &raw) {
@@ -160,8 +199,11 @@ ParsedCredentials parseCredentials(const std::string &raw) {
         result.environment = valueStr;
       } else if (key == "thing" || key == "thingname" || key == "thing_name") {
         result.thingName = valueStr;
+      } else if (key == "token" || key == "provision_token") {
+        result.provisionToken = valueStr;
       } else if (key == "aws_port" || key == "port") {
         result.awsPort = atoi(value.c_str());
+        result.awsPortProvided = true;
       }
     }
   } else {
@@ -184,6 +226,26 @@ ParsedCredentials parseCredentials(const std::string &raw) {
 
   if (result.ssid.isEmpty()) {
     result.error = "ssid";
+    return result;
+  }
+
+  if (!isValidLength(result.ssid, 128)) {
+    result.error = "ssid_len";
+    return result;
+  }
+
+  if (!isValidLength(result.password, 128)) {
+    result.error = "password_len";
+    return result;
+  }
+
+  if (!isValidDeviceId(result.deviceId)) {
+    result.error = "device_id";
+    return result;
+  }
+
+  if (result.awsPortProvided && !isValidPort(result.awsPort)) {
+    result.error = "aws_port";
     return result;
   }
 
@@ -285,36 +347,42 @@ void configureAdvertising() {
 }
 
 void ensureInitialized(const String &deviceId) {
-  if (g_initialized) {
-    g_deviceId = deviceId;
-    configureAdvertising();
-    return;
+  if (g_bootMillis == 0) {
+    g_bootMillis = millis();
   }
 
   g_deviceId = deviceId;
-  BLEDevice::init(g_deviceId.c_str());
+  if (!g_bleDeviceInitialized) {
+    BLEDevice::init(g_deviceId.c_str());
+    g_bleDeviceInitialized = true;
+  } else {
 
-  g_server = BLEDevice::createServer();
-  g_server->setCallbacks(new ServerCallbacks());
+  }
 
-  BLEService *service = g_server->createService(kServiceUuid);
-  g_characteristic = service->createCharacteristic(
-      kCharacteristicUuid,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-          BLECharacteristic::PROPERTY_NOTIFY);
-  g_characteristic->addDescriptor(new BLE2902());
-  g_characteristic->setCallbacks(new ProvisioningCallbacks());
-  g_characteristic->setValue("inactivo");
+  if (!g_server) {
+    g_server = BLEDevice::createServer();
+    g_server->setCallbacks(new ServerCallbacks());
 
-  service->start();
+    BLEService *service = g_server->createService(kServiceUuid);
+    g_characteristic = service->createCharacteristic(
+        kCharacteristicUuid,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
+            BLECharacteristic::PROPERTY_NOTIFY);
+    g_characteristic->addDescriptor(new BLE2902());
+    g_characteristic->setCallbacks(new ProvisioningCallbacks());
+    g_characteristic->setValue("inactivo");
 
-  g_advertising = BLEDevice::getAdvertising();
-  if (g_advertising) {
-    g_advertising->addServiceUUID(kServiceUuid);
+    service->start();
+
+    g_advertising = BLEDevice::getAdvertising();
+    if (g_advertising) {
+      g_advertising->addServiceUUID(kServiceUuid);
+    }
+
+    g_initialized = true;
   }
 
   configureAdvertising();
-  g_initialized = true;
 }
 }  // namespace
 
@@ -357,6 +425,28 @@ void stopBle() {
 
 bool isActive() { return g_sessionActive; }
 
+bool isProvisioningAllowed()
+{
+  if (g_bootMillis == 0)
+  {
+    g_bootMillis = millis();
+  }
+  const uint32_t elapsed = millis() - g_bootMillis;
+  const bool withinWindow = elapsed <= kProvisioningWindowMs;
+  const bool buttonPressed = digitalRead(kProvisioningButtonPin) == LOW;
+  if (withinWindow || buttonPressed)
+  {
+    g_windowWarningLogged = false;
+    return true;
+  }
+  if (!g_windowWarningLogged)
+  {
+    Serial.println("[BLE] Provisioning no permitido (fuera de ventana)");
+    g_windowWarningLogged = true;
+  }
+  return false;
+}
+
 void notifyStatus(const String &message) { notify(message); }
 
 void loop() {
@@ -397,6 +487,7 @@ void loop() {
       data.region = String(payload.region);
       data.environment = String(payload.environment);
       data.thingName = String(payload.thingName);
+      data.provisionToken = String(payload.provisionToken);
       data.awsPort = payload.awsPort;
       g_callback(data);
     }
@@ -409,4 +500,6 @@ void loop() {
 }
 
 }  // namespace Provisioning
+
+
 

@@ -1019,6 +1019,11 @@ bool connectAWS()
 
   void startBleSession()
   {
+    if (!Provisioning::isProvisioningAllowed())
+    {
+      logWithDeviceId("[BLE] Ventana de aprovisionamiento cerrada\n");
+      return;
+    }
     if (Provisioning::startBle())
     {
       g_bleActive = true;
@@ -1157,9 +1162,14 @@ bool connectAWS()
 
   void onProvisionedCredentials(const Provisioning::CredentialsData &creds)
   {
-    logWithDeviceId("[BLE] Credenciales recibidas para SSID '%s'\n", creds.ssid.c_str());
+    logWithDeviceId("[BLE] Credenciales recibidas via BLE\n");
     Config::setString("wifi", kWifiSsidKey, std::string(creds.ssid.c_str()));
     Config::setString("wifi", kWifiPassKey, std::string(creds.password.c_str()));
+    const std::string storedToken = Config::getString("device", "provision_token", "");
+    if (storedToken.empty() && creds.provisionToken.length() > 0)
+    {
+      Config::setString("device", "provision_token", std::string(creds.provisionToken.c_str()));
+    }
 
     if (creds.deviceId.length() > 0 && creds.deviceId != g_deviceId)
     {
