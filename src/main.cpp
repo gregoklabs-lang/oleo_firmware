@@ -12,6 +12,14 @@
 #include "oled_display.h"
 #include "provisioning.h"
 
+#ifndef DEVICE_PREFIX
+#define DEVICE_PREFIX "ERROR_PREFIX_"
+#endif
+
+#ifndef TOPIC_BASE
+#define TOPIC_BASE "ERROR_TOPIC/"
+#endif
+
 // ======================
 // 🔹 CONFIGURACIÓN AWS
 // ======================
@@ -574,7 +582,7 @@ namespace
     }
 
     const String payload = "{\"device_id\":\"" + g_deviceId + "\",\"user_id\":\"" + g_userId + "\"}";
-    const String topic = "devices/" + g_deviceId + "/claim";
+    const String topic = String(TOPIC_BASE) + g_deviceId + "/claim";
 
     logWithDeviceId("[AWS] Publicando claim -> %s\n", payload.c_str());
 
@@ -827,7 +835,7 @@ namespace
     char suffix[7] = {0};
     snprintf(suffix, sizeof(suffix), "%02X%02X%02X", mac[3], mac[4], mac[5]);
 
-    String id = "OLEO_";
+    String id = DEVICE_PREFIX;
     id += suffix;
     return id;
   }
@@ -994,8 +1002,8 @@ void setup()
   loadStoredUserId();
   scheduleIdentityLog();
   logWithDeviceId("[BOOT] device_id: %s\n", g_deviceId.c_str());
-  g_downlinkSettingsTopic = "devices/" + g_deviceId + "/downlink/settings";
-  g_downlinkSetpointsTopic = "devices/" + g_deviceId + "/downlink/setpoints";
+  g_downlinkSettingsTopic = String(TOPIC_BASE) + g_deviceId + "/downlink/settings";
+  g_downlinkSetpointsTopic = String(TOPIC_BASE) + g_deviceId + "/downlink/setpoints";
   loadSettingsFromPrefs();
   loadSetpointsFromPrefs();
 
