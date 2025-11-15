@@ -5,7 +5,12 @@
 #include <Preferences.h>
 #include <esp_event.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <mqtt_client.h>
+#include <driver/periph_ctrl.h>
+#include "soc/timer_group_struct.h"
+#include "soc/timer_group_reg.h"
+#include "soc/soc.h"
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <SPIFFS.h>
@@ -43,6 +48,9 @@ namespace
   constexpr uint32_t kIdentityLogDelayMs = 6000;
   constexpr uint32_t kAwsReconnectDelayMs = 5000;
   constexpr uint16_t kMqttKeepAliveSeconds = 15;
+  constexpr uint32_t kTaskWatchdogTimeoutSeconds = 8;
+  constexpr uint32_t kHardwareWatchdogTimeoutMs = 12000;
+  constexpr uint32_t kHardwareWatchdogPrescaler = 8000;
 
   enum class SystemState : uint8_t
   {
@@ -130,6 +138,8 @@ namespace
   String g_rootCaPem;
   String g_deviceCertPem;
   String g_privateKeyPem;
+  bool g_taskWatchdogEnabled = false;
+  bool g_hwWatchdogEnabled = false;
 
   // ========================== LOGGING
   void logWithDeviceId(const char *fmt, ...)
@@ -1048,11 +1058,148 @@ namespace
                     FALLING);
   }
 
+  uint32_t hardwareWatchdogTicks(uint32_t timeoutMs)
+  {
+    const uint32_t clockHz = APB_CLK_FREQ / kHardwareWatchdogPrescaler;
+    return (timeoutMs * clockHz) / 1000;
+  }
+
+  void hardwareWatchdogWriteEnable()
+  {
+    TIMERG0.wdtwprotect.wdt_wkey = TIMG_WDT_WKEY_VALUE;
+  }
+
+  void hardwareWatchdogWriteDisable()
+  {
+    TIMERG0.wdtwprotect.wdt_wkey = 0;
+  }
+
+  bool enableHardwareWatchdog()
+  {
+    if (g_hwWatchdogEnabled)
+    {
+      return true;
+    }
+
+    periph_module_enable(PERIPH_TIMG0_MODULE);
+    hardwareWatchdogWriteEnable();
+
+    TIMERG0.wdtconfig0.wdt_en = 0;
+    TIMERG0.wdtconfig0.wdt_flashboot_mod_en = 0;
+    TIMERG0.wdtconfig0.wdt_sys_reset_length = TIMG_WDT_RESET_LENGTH_3200_NS;
+    TIMERG0.wdtconfig0.wdt_cpu_reset_length = TIMG_WDT_RESET_LENGTH_3200_NS;
+    TIMERG0.wdtconfig0.wdt_use_xtal = 0;
+    TIMERG0.wdtconfig0.wdt_stg3 = TIMG_WDT_STG_SEL_OFF;
+    TIMERG0.wdtconfig0.wdt_stg2 = TIMG_WDT_STG_SEL_OFF;
+    TIMERG0.wdtconfig0.wdt_stg1 = TIMG_WDT_STG_SEL_OFF;
+    TIMERG0.wdtconfig0.wdt_stg0 = TIMG_WDT_STG_SEL_RESET_SYSTEM;
+
+    TIMERG0.wdtconfig1.wdt_clk_prescale = kHardwareWatchdogPrescaler;
+    TIMERG0.wdtconfig1.wdt_divcnt_rst = 1;
+
+    TIMERG0.wdtconfig2.wdt_stg0_hold = hardwareWatchdogTicks(kHardwareWatchdogTimeoutMs);
+    TIMERG0.wdtconfig3.wdt_stg1_hold = 0;
+    TIMERG0.wdtconfig4.wdt_stg2_hold = 0;
+    TIMERG0.wdtconfig5.wdt_stg3_hold = 0;
+
+    TIMERG0.wdtconfig0.wdt_conf_update_en = 1;
+    TIMERG0.wdtconfig0.wdt_en = 1;
+
+    hardwareWatchdogWriteDisable();
+    g_hwWatchdogEnabled = true;
+    return true;
+  }
+
+  void feedHardwareWatchdog()
+  {
+    if (!g_hwWatchdogEnabled)
+    {
+      return;
+    }
+    hardwareWatchdogWriteEnable();
+    TIMERG0.wdtfeed.wdt_feed = 1;
+    hardwareWatchdogWriteDisable();
+  }
+
+  void disableHardwareWatchdog()
+  {
+    if (!g_hwWatchdogEnabled)
+    {
+      return;
+    }
+    hardwareWatchdogWriteEnable();
+    TIMERG0.wdtconfig0.wdt_en = 0;
+    TIMERG0.wdtconfig0.wdt_conf_update_en = 1;
+    hardwareWatchdogWriteDisable();
+    periph_module_disable(PERIPH_TIMG0_MODULE);
+    g_hwWatchdogEnabled = false;
+  }
+
+  void setupWatchdogs()
+  {
+    bool initialized = false;
+    if (!g_taskWatchdogEnabled &&
+        esp_task_wdt_init(kTaskWatchdogTimeoutSeconds, true) == ESP_OK)
+    {
+      esp_task_wdt_add(nullptr);
+      g_taskWatchdogEnabled = true;
+      initialized = true;
+    }
+
+    if (enableHardwareWatchdog())
+    {
+      initialized = true;
+    }
+
+    if (initialized)
+    {
+      logWithDeviceId("[WATCHDOG] initialized\n");
+    }
+  }
+
+  void feedWatchdog()
+  {
+    if (g_taskWatchdogEnabled)
+    {
+      esp_task_wdt_reset();
+    }
+    feedHardwareWatchdog();
+
+    static uint32_t lastLogMs = 0;
+    const uint32_t now = millis();
+    if (now - lastLogMs >= 1000)
+    {
+      logWithDeviceId("[WATCHDOG] fed\n");
+      lastLogMs = now;
+    }
+  }
+
+  void disableWatchdogs()
+  {
+    if (g_taskWatchdogEnabled)
+    {
+      esp_task_wdt_delete(nullptr);
+      esp_task_wdt_deinit();
+      g_taskWatchdogEnabled = false;
+    }
+    disableHardwareWatchdog();
+  }
+
+  void logWatchdogResetIfNeeded()
+  {
+    const esp_reset_reason_t reason = esp_reset_reason();
+    if (reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT)
+    {
+      logWithDeviceId("[WATCHDOG] *** reset detected ***\n");
+    }
+  }
+
 } // namespace
 
 void setup()
 {
   Serial.begin(115200);
+  logWatchdogResetIfNeeded();
 
   g_spiffsReady = SPIFFS.begin(false);
   if (g_spiffsReady)
@@ -1095,6 +1242,7 @@ void setup()
   Provisioning::begin(g_deviceId, onProvisionedCredentials);
 
   configureButton();
+  setupWatchdogs();
 
   if (hasStoredCredentials())
   {
@@ -1111,6 +1259,7 @@ void setup()
 
 void loop()
 {
+  feedWatchdog();
   handleBleButton();
   handleBleTimeout();
   handleWifiStatus();
