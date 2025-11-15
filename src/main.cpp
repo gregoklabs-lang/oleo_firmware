@@ -49,6 +49,9 @@ namespace
   constexpr uint16_t kMqttKeepAliveSeconds = 15;
   constexpr uint32_t kAwsBackoffInitialMs = 1000;
   constexpr uint32_t kAwsBackoffMaxMs = 16000;
+  constexpr uint32_t kWifiBackoffDelaysMs[] = {2000, 4000, 8000, 16000, 30000, 60000};
+  constexpr size_t kWifiBackoffStepCount =
+      sizeof(kWifiBackoffDelaysMs) / sizeof(kWifiBackoffDelaysMs[0]);
   constexpr uint32_t kTaskWatchdogTimeoutSeconds = 8;
   constexpr uint32_t kHardwareWatchdogTimeoutMs = 12000;
   constexpr uint32_t kHardwareWatchdogPrescaler = 8000;
@@ -118,6 +121,8 @@ namespace
   bool g_wifiConnected = false;
   bool g_wifiConnecting = false;
   uint32_t g_wifiConnectStart = 0;
+  uint32_t g_nextWifiAttemptMs = 0;
+  size_t g_wifiBackoffIndex = 0;
 
   bool g_bleActive = false;
   uint32_t g_bleStartMs = 0;
@@ -793,12 +798,41 @@ namespace
     }
   }
 
+  void resetWifiBackoff()
+  {
+    g_wifiBackoffIndex = 0;
+    g_nextWifiAttemptMs = 0;
+  }
+
+  void scheduleWifiReconnect(const char *reason)
+  {
+    if (g_wifiBackoffIndex >= kWifiBackoffStepCount)
+    {
+      logWithDeviceId("[WIFI] Backoff maximo alcanzado, reiniciando...\n");
+      delay(100);
+      esp_restart();
+      return;
+    }
+
+    const size_t idx = g_wifiBackoffIndex;
+    const uint32_t delayMs = kWifiBackoffDelaysMs[idx];
+    logWithDeviceId("[WIFI] Reintento por %s en %lu ms\n",
+                    reason ? reason : "reintento",
+                    static_cast<unsigned long>(delayMs));
+    g_nextWifiAttemptMs = millis() + delayMs;
+    if (g_wifiBackoffIndex < kWifiBackoffStepCount)
+    {
+      ++g_wifiBackoffIndex;
+    }
+  }
+
   void clearStoredWifiCredentials()
   {
     const bool wasConnected = g_wifiConnected;
     WiFi.disconnect(true, true);
     g_wifiConnecting = false;
     applyWifiConnectionStatus(false);
+    resetWifiBackoff();
     if (wasConnected)
     {
       Provisioning::notifyStatus("wifi:desconectado");
@@ -839,8 +873,14 @@ namespace
     }
   }
 
-  void startWifiConnection(const char *ssid = nullptr, const char *password = nullptr)
+  void startWifiConnection(const char *ssid = nullptr, const char *password = nullptr,
+                           bool resetBackoffOnStart = false)
   {
+    if (resetBackoffOnStart)
+    {
+      resetWifiBackoff();
+    }
+
     WiFi.disconnect(false, false);
 
     if (ssid && password)
@@ -965,7 +1005,7 @@ namespace
     logWithDeviceId("[BLE] Credenciales recibidas para SSID '%s'\n", ssid.c_str());
     Provisioning::notifyStatus("wifi:conectando");
     applyWifiConnectionStatus(false);
-    startWifiConnection(ssid.c_str(), password.c_str());
+    startWifiConnection(ssid.c_str(), password.c_str(), true);
 
     if (userId.length() > 0)
     {
@@ -1034,6 +1074,18 @@ namespace
 
   void handleWifiStatus()
   {
+    if (!g_wifiConnected && !g_wifiConnecting && hasStoredCredentials())
+    {
+      if (g_nextWifiAttemptMs == 0 || millis() >= g_nextWifiAttemptMs)
+      {
+        if (g_nextWifiAttemptMs != 0)
+        {
+          logWithDeviceId("[WIFI] Ejecutando reintento programado\n");
+        }
+        startWifiConnection();
+      }
+    }
+
     wl_status_t status = WiFi.status();
 
     if (status == WL_CONNECTED)
@@ -1052,6 +1104,7 @@ namespace
         }
         g_claimPending = true;
         stopBleSession();
+        resetWifiBackoff();
       }
       g_wifiConnecting = false;
       return;
@@ -1062,6 +1115,8 @@ namespace
       logWithDeviceId("[WIFI] Conexion perdida\n");
       applyWifiConnectionStatus(false);
       Provisioning::notifyStatus("wifi:desconectado");
+      g_wifiConnecting = false;
+      scheduleWifiReconnect("desconexion wifi");
     }
 
     if (!g_wifiConnecting)
@@ -1078,6 +1133,8 @@ namespace
       WiFi.disconnect(false, false);
       g_wifiConnecting = false;
       applyWifiConnectionStatus(false);
+      scheduleWifiReconnect("error conexion");
+      return;
     }
   }
 
@@ -1277,7 +1334,7 @@ void setup()
   if (hasStoredCredentials())
   {
     logWithDeviceId("[WIFI] Credenciales guardadas detectadas\n");
-    startWifiConnection();
+    startWifiConnection(nullptr, nullptr, true);
   }
   else
   {
