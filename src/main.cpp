@@ -26,6 +26,10 @@
 #define TOPIC_BASE "ERROR_TOPIC/"
 #endif
 
+#ifndef FW_VERSION
+#define FW_VERSION "dev"
+#endif
+
 // ======================
 // 🔹 CONFIGURACIÓN AWS
 // ======================
@@ -36,7 +40,7 @@ const int AWS_IOT_PORT = 8883;
 #define CERT_PATH "/certs/device.pem.crt"
 #define KEY_PATH "/certs/private.pem.key"
 
-esp_mqtt_client_handle_t mqttClient = nullptr;
+esp_mqtt_client_handle_t g_mqttClient = nullptr;
 
 namespace
 {
@@ -135,7 +139,7 @@ namespace
   bool g_identityLogReady = false;
 
   // ===== AWS Flags
-  bool g_awsConnected = false;
+  bool g_mqttConnected = false;
   uint32_t g_nextAwsAttemptMs = 0;
   uint32_t g_currentAwsBackoffMs = kAwsBackoffInitialMs;
   bool g_claimPending = false;
@@ -147,6 +151,8 @@ namespace
   String g_privateKeyPem;
   bool g_taskWatchdogEnabled = false;
   bool g_hwWatchdogEnabled = false;
+  unsigned long lastHeartbeatMs = 0;
+  const unsigned long HEARTBEAT_INTERVAL = 60000; // 60s
 
   // ========================== LOGGING
   void logWithDeviceId(const char *fmt, ...)
@@ -470,14 +476,14 @@ namespace
 
   void clearAwsCredentials()
   {
-    if (mqttClient)
+    if (g_mqttClient)
     {
-      esp_mqtt_client_stop(mqttClient);
-      esp_mqtt_client_destroy(mqttClient);
-      mqttClient = nullptr;
+      esp_mqtt_client_stop(g_mqttClient);
+      esp_mqtt_client_destroy(g_mqttClient);
+      g_mqttClient = nullptr;
     }
     g_mqttClientStarted = false;
-    g_awsConnected = false;
+    g_mqttConnected = false;
     g_awsCredentialsLoaded = false;
     g_rootCaPem = "";
     g_deviceCertPem = "";
@@ -516,7 +522,7 @@ namespace
     switch (event->event_id)
     {
     case MQTT_EVENT_CONNECTED:
-      g_awsConnected = true;
+      g_mqttConnected = true;
       resetAwsBackoff();
       logWithDeviceId("[MQTT] Conectado\n");
       if (g_downlinkSettingsTopic.length() > 0)
@@ -545,7 +551,7 @@ namespace
       }
       break;
     case MQTT_EVENT_DISCONNECTED:
-      g_awsConnected = false;
+      g_mqttConnected = false;
       logWithDeviceId("[MQTT] Desconectado\n");
       scheduleAwsBackoff("desconexion");
       break;
@@ -571,7 +577,7 @@ namespace
 
   bool setupAWS()
   {
-    if (g_awsCredentialsLoaded && mqttClient)
+    if (g_awsCredentialsLoaded && g_mqttClient)
     {
       return true;
     }
@@ -621,11 +627,11 @@ namespace
       return false;
     }
 
-    if (mqttClient)
+    if (g_mqttClient)
     {
-      esp_mqtt_client_stop(mqttClient);
-      esp_mqtt_client_destroy(mqttClient);
-      mqttClient = nullptr;
+      esp_mqtt_client_stop(g_mqttClient);
+      esp_mqtt_client_destroy(g_mqttClient);
+      g_mqttClient = nullptr;
       g_mqttClientStarted = false;
     }
 
@@ -641,8 +647,8 @@ namespace
     config.keepalive = kMqttKeepAliveSeconds;
     config.event_handle = mqttEventHandler;
 
-    mqttClient = esp_mqtt_client_init(&config);
-    if (!mqttClient)
+    g_mqttClient = esp_mqtt_client_init(&config);
+    if (!g_mqttClient)
     {
       Serial.println("[AWS] ❌ No se pudo crear el cliente MQTT");
       clearAwsCredentials();
@@ -658,9 +664,9 @@ namespace
 
   bool connectAWS()
   {
-    if (!g_awsCredentialsLoaded || !mqttClient)
+    if (!g_awsCredentialsLoaded || !g_mqttClient)
     {
-      g_awsConnected = false;
+      g_mqttConnected = false;
       return false;
     }
 
@@ -673,7 +679,7 @@ namespace
     if (!g_mqttClientStarted)
     {
       Serial.print("[AWS] 🔌 Iniciando cliente MQTT... ");
-      if (esp_mqtt_client_start(mqttClient) == ESP_OK)
+      if (esp_mqtt_client_start(g_mqttClient) == ESP_OK)
       {
         Serial.println("listo");
         g_mqttClientStarted = true;
@@ -685,7 +691,7 @@ namespace
       return false;
     }
 
-    esp_err_t err = esp_mqtt_client_reconnect(mqttClient);
+    esp_err_t err = esp_mqtt_client_reconnect(g_mqttClient);
     if (err == ESP_OK)
     {
       Serial.println("[AWS] Reintentando conexion MQTT");
@@ -700,7 +706,7 @@ namespace
 
   void sendProvisioningClaim()
   {
-    if (!g_claimPending || !mqttClient || !g_awsConnected)
+    if (!g_claimPending || !g_mqttClient || !g_mqttConnected)
     {
       return;
     }
@@ -717,7 +723,7 @@ namespace
 
     logWithDeviceId("[AWS] Publicando claim -> %s\n", payload.c_str());
 
-    const int msgId = esp_mqtt_client_publish(mqttClient,
+    const int msgId = esp_mqtt_client_publish(g_mqttClient,
                                               topic.c_str(),
                                               payload.c_str(),
                                               static_cast<int>(payload.length()),
@@ -736,14 +742,14 @@ namespace
 
   void handleAWS()
   {
-    if (!g_wifiConnected || !g_awsCredentialsLoaded || !mqttClient)
+    if (!g_wifiConnected || !g_awsCredentialsLoaded || !g_mqttClient)
     {
-      g_awsConnected = false;
+      g_mqttConnected = false;
       resetAwsBackoff();
       return;
     }
 
-    if (!g_awsConnected)
+    if (!g_mqttConnected)
     {
       connectAWS();
       return;
@@ -796,6 +802,38 @@ namespace
     {
       Display::setConnectionStatus(connected);
     }
+  }
+
+  void sendHeartbeat() {
+
+      if (!g_mqttConnected) {
+          Serial.println("[HEARTBEAT] Saltado (MQTT offline)");
+          return;
+      }
+
+      String topic = String(TOPIC_BASE) + g_deviceId + "/heartbeat";
+
+      StaticJsonDocument<256> doc;
+      doc["mqtt_topic"] = topic;
+      doc["client_id"] = g_deviceId;
+      doc["wifi_rssi"] = WiFi.RSSI();
+      doc["heap_free"] = esp_get_free_heap_size();
+      doc["uptime_ms"] = millis();
+      doc["fw"] = FW_VERSION;
+
+      char buffer[256];
+      size_t len = serializeJson(doc, buffer);
+
+      int mid = esp_mqtt_client_publish(
+          g_mqttClient,
+          topic.c_str(),
+          buffer,
+          len,
+          1,   // QoS1 real
+          0    // retain false
+      );
+
+      Serial.printf("[HEARTBEAT] Enviado MID=%d → %s\n", mid, topic.c_str());
   }
 
   void resetWifiBackoff()
@@ -1347,6 +1385,11 @@ void setup()
 void loop()
 {
   feedWatchdog();
+  unsigned long now = millis();
+  if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL) {
+    sendHeartbeat();
+    lastHeartbeatMs = now;
+  }
   handleBleButton();
   handleBleTimeout();
   handleWifiStatus();
