@@ -14,10 +14,14 @@
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <SPIFFS.h>
+#include <cmath>
 #include <cstring>
 #include <string>
 
 #include "Config.hpp"
+#include "AnalogPpfdMonitor.h"
+#include "SensorDiscovery.h"
+#include "SensorId.h"
 #include "oled_display.h"
 #include "provisioning.h"
 
@@ -174,6 +178,10 @@ namespace
   String g_rootCaPath;
   String g_deviceCertPath;
   String g_privateKeyPath;
+  constexpr float kPpfdTelemetryDelta = 2.0f;
+  constexpr unsigned long kPpfdMinPublishIntervalMs = 5000;
+  float g_lastPpfdTelemetryValue = NAN;
+  unsigned long g_lastPpfdPublishMs = 0;
 
   String toArduino(const std::string &value)
   {
@@ -555,7 +563,7 @@ namespace
     logWithDeviceId("📩 [MQTT] Mensaje en %s:\n", topicStr.c_str());
     logWithDeviceId("%s\n", payloadStr.c_str());
 
-    DynamicJsonDocument doc(768);
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payloadStr);
     if (err)
     {
@@ -927,16 +935,17 @@ bool connectAWS()
     }
   }
 
-  void sendHeartbeat() {
-
-      if (!g_mqttConnected) {
+  void sendHeartbeat()
+  {
+      if (!g_mqttConnected)
+      {
           Serial.println("[HEARTBEAT] Saltado (MQTT offline)");
           return;
       }
 
       String topic = String(TOPIC_BASE) + g_deviceId + "/heartbeat";
 
-      StaticJsonDocument<256> doc;
+      JsonDocument doc;
       doc["mqtt_topic"] = topic;
       doc["client_id"] = g_deviceId;
       doc["wifi_rssi"] = WiFi.RSSI();
@@ -944,19 +953,30 @@ bool connectAWS()
       doc["uptime_ms"] = millis();
       doc["fw"] = FW_VERSION;
 
-      char buffer[256];
-      size_t len = serializeJson(doc, buffer);
+      char buffer[256] = {0};
+      const size_t len = serializeJson(doc, buffer, sizeof(buffer));
+      if (len == 0 || len >= sizeof(buffer))
+      {
+          Serial.println("[HEARTBEAT] serialize failed");
+          return;
+      }
 
       int mid = esp_mqtt_client_publish(
           g_mqttClient,
           topic.c_str(),
           buffer,
-          len,
-          1,   // QoS1 real
-          0    // retain false
-      );
+          static_cast<int>(len),
+          1,
+          0);
 
-      Serial.printf("[HEARTBEAT] Enviado MID=%d → %s\n", mid, topic.c_str());
+      if (mid < 0)
+      {
+          Serial.printf("[HEARTBEAT] Publicación fallida en %s\n", topic.c_str());
+      }
+      else
+      {
+          Serial.printf("[HEARTBEAT] Enviado MID=%d -> %s\n", mid, topic.c_str());
+      }
   }
 
   void resetWifiBackoff()
@@ -1493,6 +1513,103 @@ bool connectAWS()
 
 } // namespace
 
+String &device_id = g_deviceId;
+
+bool mqttTelemetryReady()
+{
+  return g_mqttClient != nullptr && g_mqttConnected;
+}
+
+bool mqttDiscoveryReady()
+{
+  return mqttTelemetryReady();
+}
+
+bool publishDiscoveryMessage(const char *topic, const char *payload)
+{
+  if (!mqttDiscoveryReady())
+  {
+    return false;
+  }
+  const int msgId = esp_mqtt_client_publish(g_mqttClient,
+                                            topic,
+                                            payload,
+                                            static_cast<int>(strlen(payload)),
+                                            1,
+                                            0);
+  return msgId >= 0;
+}
+
+bool publishTelemetry(float value)
+{
+  if (!mqttTelemetryReady())
+  {
+    Serial.println("[TELEM] omitido (MQTT offline)");
+    return false;
+  }
+
+  JsonDocument doc;
+  doc["device_id"] = g_deviceId;
+  JsonArray readings = doc["readings"].to<JsonArray>();
+  JsonObject entry = readings.add<JsonObject>();
+  const String sensorId = makeSensorId(g_deviceId, "ADC", "A1");
+  entry["sensor_id"] = sensorId;
+  entry["value"] = value;
+
+  char payload[384] = {0};
+  const size_t bytes = serializeJson(doc, payload, sizeof(payload));
+  if (bytes == 0 || bytes >= sizeof(payload))
+  {
+    Serial.println("[TELEM] serialize failed");
+    return false;
+  }
+
+  const String topic = String(TOPIC_BASE) + g_deviceId + "/telemetry";
+  const int msgId = esp_mqtt_client_publish(g_mqttClient,
+                                            topic.c_str(),
+                                            payload,
+                                            static_cast<int>(bytes),
+                                            1,
+                                            0);
+  if (msgId < 0)
+  {
+    Serial.println("[TELEM] publish failed");
+    return false;
+  }
+
+  Serial.println("⛳ SENSOR_ID ENVIADO = " + sensorId);
+  return true;
+}
+
+void handlePpfdTelemetry(float value)
+{
+  const unsigned long now = millis();
+  bool shouldPublish = false;
+  if (!std::isfinite(g_lastPpfdTelemetryValue))
+  {
+    shouldPublish = true;
+  }
+  else if (fabs(value - g_lastPpfdTelemetryValue) >= kPpfdTelemetryDelta)
+  {
+    shouldPublish = true;
+  }
+  else if (now - g_lastPpfdPublishMs >= kPpfdMinPublishIntervalMs)
+  {
+    shouldPublish = true;
+  }
+
+  if (!shouldPublish)
+  {
+    return;
+  }
+
+  if (publishTelemetry(value))
+  {
+    g_lastPpfdTelemetryValue = value;
+    g_lastPpfdPublishMs = now;
+  }
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -1540,6 +1657,18 @@ void setup()
 
   Provisioning::begin(g_deviceId, onProvisionedCredentials);
 
+  PpfdAnalogMonitor::Calibration ppfdCalibration;
+  ppfdCalibration.r1Ohms = 3569.0f;
+  ppfdCalibration.r2Ohms = 1100.0f;
+  ppfdCalibration.sensorVoltageMax = 5.0f;
+  ppfdCalibration.ppfdFullScale = 2500.0f;
+  ppfdCalibration.calibrationFactor = 1.0f;
+  ppfdCalibration.samplesPerReading = 10;
+  PpfdAnalogMonitor::setCalibration(ppfdCalibration);
+  PpfdAnalogMonitor::setTelemetryCallback(handlePpfdTelemetry);
+  PpfdAnalogMonitor::begin();
+  SensorDiscovery::begin(g_deviceId, publishDiscoveryMessage, mqttDiscoveryReady);
+
   configureButton();
   setupWatchdogs();
 
@@ -1577,6 +1706,8 @@ void loop()
 
   Provisioning::loop();
   Display::loop();
+  SensorDiscovery::loop();
+  PpfdAnalogMonitor::loop();
 
   delay(1);
 }

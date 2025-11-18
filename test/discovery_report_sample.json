@@ -1,0 +1,29 @@
+{
+  "device_id": "DEVICE_SAMPLE",
+  "sensors": [
+    {
+      "sensor_id": "SNR_DEVICE_SAMPLE_ADC_A1",
+      "type": "ppfd",
+      "bus_type": "ADC",
+      "address": "A1",
+      "metadata": {
+        "unit": "µmol/m²/s",
+        "pin": 36
+      },
+      "is_active": true,
+      "last_seen": "2025-11-15T12:00:00Z"
+    },
+    {
+      "sensor_id": "SNR_DEVICE_SAMPLE_SDI12_3",
+      "type": "sdi12",
+      "bus_type": "SDI12",
+      "address": "3",
+      "metadata": {
+        "unit": "raw",
+        "pin": 17
+      },
+      "is_active": false,
+      "last_seen": "2025-11-15T11:55:00Z"
+    }
+  ]
+}
