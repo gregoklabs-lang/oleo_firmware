@@ -136,8 +136,8 @@ namespace
   unsigned long lastTelemetryMs = 0;
   unsigned long lastSensorLogMs = 0;
   const unsigned long HEARTBEAT_INTERVAL = 60000; // 60s
-  const unsigned long TELEMETRY_INTERVAL = 4000; // Tiempo en que se envia playload
-  const unsigned long SENSOR_LOG_INTERVAL = 4000; // Tiempo de registro en esp32
+  const unsigned long TELEMETRY_INTERVAL = 8000; // Tiempo en que se envia playload
+  const unsigned long SENSOR_LOG_INTERVAL = 8000; // Tiempo de registro en esp32
   String g_rootCaPath;
   String g_deviceCertPath;
   String g_privateKeyPath;
