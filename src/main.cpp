@@ -2,8 +2,6 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <stdarg.h>
-#include <Preferences.h>
-#include <esp_event.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <mqtt_client.h>
@@ -14,16 +12,14 @@
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <SPIFFS.h>
-#include <cmath>
 #include <cstring>
 #include <string>
 
 #include "Config.hpp"
-#include "AnalogPpfdMonitor.h"
-#include "SensorDiscovery.h"
-#include "SensorId.h"
 #include "oled_display.h"
 #include "provisioning.h"
+#include "sensor_registry.h"
+#include "sht45_sensor.h"
 
 #ifndef DEVICE_PREFIX
 #define DEVICE_PREFIX "ERROR_PREFIX_"
@@ -40,11 +36,12 @@
 // ======================
 // 🔹 CONFIGURACIÓN AWS
 // ======================
-constexpr const char kDefaultAwsEndpoint[] = "a7xxu98k219gv-ats.iot.us-east-1.amazonaws.com";
+constexpr const char kDefaultAwsEndpoint[] = "awvhj0h4worjs-ats.iot.us-east-1.amazonaws.com";
 constexpr int32_t kDefaultAwsPort = 8883;
 constexpr const char kDefaultAwsRegion[] = "us-east-1";
 constexpr const char kDefaultThingName[] = "";
 constexpr const char kDefaultEnv[] = "prod";
+constexpr const char kDefaultDeviceKind[] = "climate_sensor";
 constexpr const char kDefaultRootCaPath[] = "/certs/AmazonRootCA1.pem";
 constexpr const char kDefaultDeviceCertPath[] = "/certs/device.pem.crt";
 constexpr const char kDefaultPrivateKeyPath[] = "/certs/private.pem.key";
@@ -79,6 +76,7 @@ namespace
   constexpr uint16_t kMqttKeepAliveSeconds = 15;
   constexpr uint32_t kAwsBackoffInitialMs = 1000;
   constexpr uint32_t kAwsBackoffMaxMs = 16000;
+  constexpr uint32_t kAwsInitialConnectGraceMs = 3000;
   constexpr uint32_t kWifiBackoffDelaysMs[] = {2000, 4000, 8000, 16000, 30000, 60000};
   constexpr size_t kWifiBackoffStepCount =
       sizeof(kWifiBackoffDelaysMs) / sizeof(kWifiBackoffDelaysMs[0]);
@@ -93,55 +91,12 @@ namespace
     BLE_ACTIVE,
   };
 
-  Preferences g_settingsPrefs;
-  bool g_settingsPrefsReady = false;
-  constexpr char kSettingsPrefsNamespace[] = "settings";
-  constexpr char kSettingsReservoirUnitsKey[] = "res_units";
-  constexpr char kSettingsTempUnitsKey[] = "temp_units";
-  constexpr char kSettingsNutrientsUnitsKey[] = "nutri_units";
-  constexpr char kSettingsEmailKey[] = "email_notif";
-
-  Preferences g_setpointsPrefs;
-  bool g_setpointsPrefsReady = false;
-  constexpr char kSetpointsPrefsNamespace[] = "setpoints";
-  constexpr char kSetpointsPhKey[] = "ph_target";
-  constexpr char kSetpointsEcKey[] = "ec_target";
-  constexpr char kSetpointsTempKey[] = "temp_target";
-  constexpr char kSetpointsFlowKey[] = "flow_target";
-  constexpr char kSetpointsModeKey[] = "dosing_mode";
-  constexpr char kSetpointsVersionKey[] = "version";
-  constexpr char kSetpointsReservoirKey[] = "reservoir";
-
-  struct DownlinkSettings
-  {
-    String reservoirUnits;
-    String temperatureUnits;
-    String nutrientsUnits;
-    bool emailNotifications = false;
-  };
-
-  DownlinkSettings g_downlinkSettings;
-  String g_downlinkSettingsTopic;
-
-  struct DownlinkSetpoints
-  {
-    float phTarget = 0.0f;
-    float ecTarget = 0.0f;
-    float tempTarget = 0.0f;
-    float flowTarget = 0.0f;
-    String dosingMode;
-    String version;
-    float reservoirSize = 0.0f;
-  };
-
-  DownlinkSetpoints g_downlinkSetpoints;
-  String g_downlinkSetpointsTopic;
-
   String g_deviceId;
   String g_userId;
   String g_environment;
   String g_awsRegion;
   String g_macAddress;
+  String g_bootSessionId;
   SystemState g_state = SystemState::WIFI_DISCONNECTED;
 
   bool g_wifiConnected = false;
@@ -165,27 +120,57 @@ namespace
   uint32_t g_nextAwsAttemptMs = 0;
   uint32_t g_currentAwsBackoffMs = kAwsBackoffInitialMs;
   bool g_claimPending = false;
+  bool g_sensorRegistryPending = true;
   bool g_awsCredentialsLoaded = false;
   bool g_spiffsReady = false;
   bool g_mqttClientStarted = false;
+  uint32_t g_eventSequence = 0;
+  String g_pendingClaimEventKey;
+  String g_pendingSensorRegistryEventKey;
   String g_rootCaPem;
   String g_deviceCertPem;
   String g_privateKeyPem;
   bool g_taskWatchdogEnabled = false;
   bool g_hwWatchdogEnabled = false;
   unsigned long lastHeartbeatMs = 0;
+  unsigned long lastTelemetryMs = 0;
+  unsigned long lastSensorLogMs = 0;
   const unsigned long HEARTBEAT_INTERVAL = 60000; // 60s
+  const unsigned long TELEMETRY_INTERVAL = 4000; // Tiempo en que se envia playload
+  const unsigned long SENSOR_LOG_INTERVAL = 4000; // Tiempo de registro en esp32
   String g_rootCaPath;
   String g_deviceCertPath;
   String g_privateKeyPath;
-  constexpr float kPpfdTelemetryDelta = 2.0f;
-  constexpr unsigned long kPpfdMinPublishIntervalMs = 5000;
-  float g_lastPpfdTelemetryValue = NAN;
-  unsigned long g_lastPpfdPublishMs = 0;
 
   String toArduino(const std::string &value)
   {
     return value.empty() ? String() : String(value.c_str());
+  }
+
+  String buildBootSessionId()
+  {
+    char buffer[17] = {0};
+    const uint32_t a = static_cast<uint32_t>(esp_random());
+    const uint32_t b = static_cast<uint32_t>(esp_random());
+    snprintf(buffer, sizeof(buffer), "%08lx%08lx",
+             static_cast<unsigned long>(a),
+             static_cast<unsigned long>(b));
+    return String(buffer);
+  }
+
+  String nextEventKey(const char *kind)
+  {
+    ++g_eventSequence;
+    char buffer[128] = {0};
+    snprintf(buffer,
+             sizeof(buffer),
+             "%s:%s:%s:%lu:%lu",
+             kind ? kind : "event",
+             g_deviceId.c_str(),
+             g_bootSessionId.c_str(),
+             static_cast<unsigned long>(g_eventSequence),
+             static_cast<unsigned long>(millis()));
+    return String(buffer);
   }
 
   void seedConfigDefaults()
@@ -257,12 +242,6 @@ namespace
     return ssid.length() > 0;
   }
 
-  void updateDownlinkTopics()
-  {
-    g_downlinkSettingsTopic = String(TOPIC_BASE) + g_deviceId + "/downlink/settings";
-    g_downlinkSetpointsTopic = String(TOPIC_BASE) + g_deviceId + "/downlink/setpoints";
-  }
-
   // ========================== LOGGING
   void logWithDeviceId(const char *fmt, ...)
   {
@@ -275,314 +254,9 @@ namespace
     const char *deviceId = g_deviceId.length() > 0 ? g_deviceId.c_str() : "UNKNOWN";
     Serial.printf("[%s] %s", deviceId, buffer);
   }
-
-  const char *unitsOrDefault(const String &value, const char *fallback)
-  {
-    return value.length() > 0 ? value.c_str() : fallback;
-  }
-
-  void logStoredSetpoints(const char *header = "[SETPOINTS] 🔁 Cargados desde NVS:")
-  {
-    logWithDeviceId("%s\n", header);
-    logWithDeviceId("   - pH target: %.2f\n", g_downlinkSetpoints.phTarget);
-    logWithDeviceId("   - EC target: %.2f %s\n",
-                    g_downlinkSetpoints.ecTarget,
-                    unitsOrDefault(g_downlinkSettings.nutrientsUnits, "N/A"));
-    logWithDeviceId("   - Temp target: %.2f %s\n",
-                    g_downlinkSetpoints.tempTarget,
-                    unitsOrDefault(g_downlinkSettings.temperatureUnits, "N/A"));
-    logWithDeviceId("   - Flow target (L/min): %.2f\n", g_downlinkSetpoints.flowTarget);
-    logWithDeviceId("   - Dosing mode: %s\n", g_downlinkSetpoints.dosingMode.c_str());
-    logWithDeviceId("   - Version: %s\n", g_downlinkSetpoints.version.c_str());
-    logWithDeviceId("   - Reservoir size: %.2f %s\n",
-                    g_downlinkSetpoints.reservoirSize,
-                    unitsOrDefault(g_downlinkSettings.reservoirUnits, "N/A"));
-  }
-
-  void logStoredSettings(const char *header = "[SETTINGS] 🔁 Cargadas desde NVS:")
-  {
-    logWithDeviceId("%s\n", header);
-    logWithDeviceId("   - Reservoir units: %s\n",
-                    unitsOrDefault(g_downlinkSettings.reservoirUnits, "N/A"));
-    logWithDeviceId("   - Temp units: %s\n",
-                    unitsOrDefault(g_downlinkSettings.temperatureUnits, "N/A"));
-    logWithDeviceId("   - Nutrients units: %s\n",
-                    unitsOrDefault(g_downlinkSettings.nutrientsUnits, "N/A"));
-    logWithDeviceId("   - Email notifications: %d\n", g_downlinkSettings.emailNotifications ? 1 : 0);
-  }
-
   void IRAM_ATTR onBleButtonPressed() { g_bleButtonInterrupt = true; }
 
-  // =========================================================
-  // 🔽 DOWNLINK SETTINGS HANDLER
-  // =========================================================
-
-  bool beginSettingsPrefs()
-  {
-    if (g_settingsPrefsReady)
-    {
-      return true;
-    }
-
-    g_settingsPrefsReady = g_settingsPrefs.begin(kSettingsPrefsNamespace, false);
-    if (!g_settingsPrefsReady)
-    {
-      Serial.println("[settings] No se pudieron abrir las preferencias");
-    }
-    return g_settingsPrefsReady;
-  }
-
-  void loadSettingsFromPrefs()
-  {
-    if (!beginSettingsPrefs())
-    {
-      logWithDeviceId("[SETTINGS] ⚠️ No se pudieron cargar las preferencias\n");
-      return;
-    }
-
-    const bool hasAnyStored =
-        g_settingsPrefs.isKey(kSettingsReservoirUnitsKey) ||
-        g_settingsPrefs.isKey(kSettingsTempUnitsKey) ||
-        g_settingsPrefs.isKey(kSettingsNutrientsUnitsKey) ||
-        g_settingsPrefs.isKey(kSettingsEmailKey);
-
-    g_downlinkSettings.reservoirUnits = g_settingsPrefs.getString(kSettingsReservoirUnitsKey, g_downlinkSettings.reservoirUnits);
-    g_downlinkSettings.temperatureUnits = g_settingsPrefs.getString(kSettingsTempUnitsKey, g_downlinkSettings.temperatureUnits);
-    g_downlinkSettings.nutrientsUnits = g_settingsPrefs.getString(kSettingsNutrientsUnitsKey, g_downlinkSettings.nutrientsUnits);
-    g_downlinkSettings.emailNotifications = g_settingsPrefs.getBool(kSettingsEmailKey, g_downlinkSettings.emailNotifications);
-
-    if (!hasAnyStored)
-    {
-      logWithDeviceId("[SETTINGS] ⚠️ No hay configuraciones almacenadas (usando valores por defecto)\n");
-    }
-
-    logStoredSettings();
-  }
-
-  bool beginSetpointsPrefs()
-  {
-    if (g_setpointsPrefsReady)
-    {
-      return true;
-    }
-
-    g_setpointsPrefsReady = g_setpointsPrefs.begin(kSetpointsPrefsNamespace, false);
-    if (!g_setpointsPrefsReady)
-    {
-      logWithDeviceId("[SETPOINTS] ⚠️ No se pudieron abrir las preferencias\n");
-      return false;
-    }
-
-    return g_setpointsPrefsReady;
-  }
-
-  void loadSetpointsFromPrefs()
-  {
-    if (!beginSetpointsPrefs())
-    {
-      return;
-    }
-
-    const bool hasAnyStored =
-        g_setpointsPrefs.isKey(kSetpointsPhKey) ||
-        g_setpointsPrefs.isKey(kSetpointsEcKey) ||
-        g_setpointsPrefs.isKey(kSetpointsTempKey) ||
-        g_setpointsPrefs.isKey(kSetpointsFlowKey) ||
-        g_setpointsPrefs.isKey(kSetpointsModeKey) ||
-        g_setpointsPrefs.isKey(kSetpointsVersionKey) ||
-        g_setpointsPrefs.isKey(kSetpointsReservoirKey);
-
-    g_downlinkSetpoints.phTarget = g_setpointsPrefs.getFloat(kSetpointsPhKey, g_downlinkSetpoints.phTarget);
-    g_downlinkSetpoints.ecTarget = g_setpointsPrefs.getFloat(kSetpointsEcKey, g_downlinkSetpoints.ecTarget);
-    g_downlinkSetpoints.tempTarget = g_setpointsPrefs.getFloat(kSetpointsTempKey, g_downlinkSetpoints.tempTarget);
-    g_downlinkSetpoints.flowTarget = g_setpointsPrefs.getFloat(kSetpointsFlowKey, g_downlinkSetpoints.flowTarget);
-    g_downlinkSetpoints.dosingMode = g_setpointsPrefs.getString(kSetpointsModeKey, g_downlinkSetpoints.dosingMode);
-    g_downlinkSetpoints.version = g_setpointsPrefs.getString(kSetpointsVersionKey, g_downlinkSetpoints.version);
-    g_downlinkSetpoints.reservoirSize = g_setpointsPrefs.getFloat(kSetpointsReservoirKey, g_downlinkSetpoints.reservoirSize);
-
-    if (!hasAnyStored)
-    {
-      logWithDeviceId("[SETPOINTS] ⚠️ No hay setpoints almacenados\n");
-      return;
-    }
-
-    logStoredSetpoints();
-  }
-
-  void handleSettingsDownlink(JsonDocument &doc)
-  {
-    const char *cmd = doc["cmd"] | "";
-    const bool isUpdateSettings =
-        strcmp(cmd, "update_settings") == 0 ||
-        strcmp(cmd, "update_user_settings") == 0;
-    if (!isUpdateSettings)
-    {
-      logWithDeviceId("[MQTT] ⚠️ Comando inesperado: %s\n", cmd);
-      return;
-    }
-
-    if (!doc["settings"].is<JsonObject>())
-    {
-      logWithDeviceId("[MQTT] ⚠️ Campo 'settings' ausente o invalido\n");
-      return;
-    }
-
-    JsonObject settings = doc["settings"].as<JsonObject>();
-
-    if (settings["reservoir_size_units"].isNull() ||
-        settings["temperature_units"].isNull() ||
-        settings["nutrients_units"].isNull() ||
-        settings["email_notifications"].isNull())
-    {
-      logWithDeviceId("[MQTT] ⚠️ Configuración incompleta recibida\n");
-      return;
-    }
-
-    g_downlinkSettings.reservoirUnits = settings["reservoir_size_units"].as<const char *>();
-    g_downlinkSettings.temperatureUnits = settings["temperature_units"].as<const char *>();
-    g_downlinkSettings.nutrientsUnits = settings["nutrients_units"].as<const char *>();
-    g_downlinkSettings.emailNotifications = settings["email_notifications"].as<bool>();
-
-    if (!beginSettingsPrefs())
-    {
-      logWithDeviceId("[MQTT] ⚠️ No se pudieron abrir preferencias para guardar ajustes\n");
-      return;
-    }
-
-    g_settingsPrefs.putString(kSettingsReservoirUnitsKey, g_downlinkSettings.reservoirUnits);
-    g_settingsPrefs.putString(kSettingsTempUnitsKey, g_downlinkSettings.temperatureUnits);
-    g_settingsPrefs.putString(kSettingsNutrientsUnitsKey, g_downlinkSettings.nutrientsUnits);
-    g_settingsPrefs.putBool(kSettingsEmailKey, g_downlinkSettings.emailNotifications);
-
-    logStoredSettings("[SETTINGS] ✅ Actualizadas desde downlink:");
-  }
-
-  void handleSetpointsDownlink(JsonDocument &doc)
-  {
-    const char *cmd = doc["cmd"] | "";
-    if (strcmp(cmd, "update_setpoints") != 0)
-    {
-      logWithDeviceId("[MQTT] ⚠️ Comando inesperado para setpoints: %s\n", cmd);
-      return;
-    }
-
-    if (!doc["setpoints"].is<JsonObject>())
-    {
-      logWithDeviceId("[MQTT] ⚠️ Campo 'setpoints' ausente o invalido\n");
-      return;
-    }
-
-    JsonObject sp = doc["setpoints"].as<JsonObject>();
-
-    bool hasUpdate = false;
-
-    if (!sp["ph_target"].isNull())
-    {
-      g_downlinkSetpoints.phTarget = sp["ph_target"].as<float>();
-      hasUpdate = true;
-    }
-    if (!sp["ec_target"].isNull())
-    {
-      g_downlinkSetpoints.ecTarget = sp["ec_target"].as<float>();
-      hasUpdate = true;
-    }
-    if (!sp["temp_target"].isNull())
-    {
-      g_downlinkSetpoints.tempTarget = sp["temp_target"].as<float>();
-      hasUpdate = true;
-    }
-    if (!sp["flow_target_l_min"].isNull())
-    {
-      g_downlinkSetpoints.flowTarget = sp["flow_target_l_min"].as<float>();
-      hasUpdate = true;
-    }
-    if (!sp["dosing_mode"].isNull())
-    {
-      g_downlinkSetpoints.dosingMode = sp["dosing_mode"].as<const char *>();
-      hasUpdate = true;
-    }
-    if (!sp["version"].isNull())
-    {
-      g_downlinkSetpoints.version = sp["version"].as<const char *>();
-      hasUpdate = true;
-    }
-    if (!sp["reservoir_size"].isNull())
-    {
-      g_downlinkSetpoints.reservoirSize = sp["reservoir_size"].as<float>();
-      hasUpdate = true;
-    }
-
-    if (!hasUpdate)
-    {
-      logWithDeviceId("[MQTT] ⚠️ Setpoints recibidos sin cambios (todos nulos)\n");
-      return;
-    }
-
-    if (!beginSetpointsPrefs())
-    {
-      logWithDeviceId("[MQTT] ⚠️ No se pudieron abrir preferencias para guardar setpoints\n");
-      return;
-    }
-
-    g_setpointsPrefs.putFloat(kSetpointsPhKey, g_downlinkSetpoints.phTarget);
-    g_setpointsPrefs.putFloat(kSetpointsEcKey, g_downlinkSetpoints.ecTarget);
-    g_setpointsPrefs.putFloat(kSetpointsTempKey, g_downlinkSetpoints.tempTarget);
-    g_setpointsPrefs.putFloat(kSetpointsFlowKey, g_downlinkSetpoints.flowTarget);
-    g_setpointsPrefs.putString(kSetpointsModeKey, g_downlinkSetpoints.dosingMode);
-    g_setpointsPrefs.putString(kSetpointsVersionKey, g_downlinkSetpoints.version);
-    g_setpointsPrefs.putFloat(kSetpointsReservoirKey, g_downlinkSetpoints.reservoirSize);
-
-    logStoredSetpoints("[SETPOINTS] ✅ Actualizados desde downlink:");
-  }
-
-  void mqttCallback(const char *topic, const uint8_t *payload, unsigned int length)
-  {
-    if (!topic)
-    {
-      logWithDeviceId("[MQTT] ⚠️ Callback sin topic\n");
-      return;
-    }
-
-    const String topicStr(topic);
-    const bool isSettingsTopic = g_downlinkSettingsTopic.length() && topicStr == g_downlinkSettingsTopic;
-    const bool isSetpointsTopic = g_downlinkSetpointsTopic.length() && topicStr == g_downlinkSetpointsTopic;
-
-    if (!isSettingsTopic && !isSetpointsTopic)
-    {
-      // Ignora otros topics manteniendo el loop limpio.
-      return;
-    }
-
-    String payloadStr;
-    payloadStr.reserve(length + 1);
-    for (unsigned int i = 0; i < length; ++i)
-    {
-      payloadStr += static_cast<char>(payload[i]);
-    }
-
-    logWithDeviceId("📩 [MQTT] Mensaje en %s:\n", topicStr.c_str());
-    logWithDeviceId("%s\n", payloadStr.c_str());
-
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payloadStr);
-    if (err)
-    {
-      logWithDeviceId("[MQTT] ⚠️ Error al parsear JSON: %s\n", err.c_str());
-      return;
-    }
-
-    if (isSettingsTopic)
-    {
-      handleSettingsDownlink(doc);
-    }
-    else if (isSetpointsTopic)
-    {
-      handleSetpointsDownlink(doc);
-    }
-  }
-
   // ========================== AWS HELPERS
-
   void clearAwsCredentials()
   {
     if (g_mqttClient)
@@ -594,11 +268,14 @@ namespace
     g_mqttClientStarted = false;
     g_mqttConnected = false;
     g_awsCredentialsLoaded = false;
+    g_sensorRegistryPending = true;
     g_rootCaPem = "";
     g_deviceCertPem = "";
     g_privateKeyPem = "";
     g_nextAwsAttemptMs = 0;
     g_currentAwsBackoffMs = kAwsBackoffInitialMs;
+    g_pendingClaimEventKey = "";
+    g_pendingSensorRegistryEventKey = "";
   }
 
   void resetAwsBackoff()
@@ -635,46 +312,12 @@ namespace
       g_mqttConnected = true;
       resetAwsBackoff();
       logWithDeviceId("[MQTT] Conectado\n");
-      if (g_downlinkSettingsTopic.length() > 0)
-      {
-        const int msgId = esp_mqtt_client_subscribe(event->client, g_downlinkSettingsTopic.c_str(), 1);
-        if (msgId >= 0)
-        {
-          logWithDeviceId("[MQTT] Suscrito a %s\n", g_downlinkSettingsTopic.c_str());
-        }
-        else
-        {
-          logWithDeviceId("[MQTT] ⚠️ Fallo al suscribir %s\n", g_downlinkSettingsTopic.c_str());
-        }
-      }
-      if (g_downlinkSetpointsTopic.length() > 0)
-      {
-        const int msgId = esp_mqtt_client_subscribe(event->client, g_downlinkSetpointsTopic.c_str(), 1);
-        if (msgId >= 0)
-        {
-          logWithDeviceId("[MQTT] Suscrito a %s\n", g_downlinkSetpointsTopic.c_str());
-        }
-        else
-        {
-          logWithDeviceId("[MQTT] ⚠️ Fallo al suscribir %s\n", g_downlinkSetpointsTopic.c_str());
-        }
-      }
       break;
     case MQTT_EVENT_DISCONNECTED:
       g_mqttConnected = false;
       logWithDeviceId("[MQTT] Desconectado\n");
       scheduleAwsBackoff("desconexion");
       break;
-    case MQTT_EVENT_DATA:
-    {
-      if (!event->topic || event->topic_len == 0)
-      {
-        break;
-      }
-      String topicCopy(event->topic, event->topic_len);
-      mqttCallback(topicCopy.c_str(), reinterpret_cast<const uint8_t *>(event->data), event->data_len);
-      break;
-    }
     case MQTT_EVENT_ERROR:
       logWithDeviceId("[MQTT] Error en evento MQTT\n");
       break;
@@ -814,7 +457,7 @@ bool connectAWS()
       {
         Serial.println("listo");
         g_mqttClientStarted = true;
-        g_nextAwsAttemptMs = millis() + g_currentAwsBackoffMs;
+        g_nextAwsAttemptMs = millis() + kAwsInitialConnectGraceMs;
         return true;
       }
       Serial.println("fallo");
@@ -849,10 +492,18 @@ bool connectAWS()
       return;
     }
 
-    const String payload = "{\"device_id\":\"" + g_deviceId + "\",\"user_id\":\"" + g_userId + "\"}";
+    if (g_pendingClaimEventKey.length() == 0)
+    {
+      g_pendingClaimEventKey = nextEventKey("claim");
+    }
+
+    const String payload = "{\"device_id\":\"" + g_deviceId +
+                           "\",\"user_id\":\"" + g_userId +
+                           "\",\"device_kind\":\"" + String(kDefaultDeviceKind) +
+                           "\",\"event_key\":\"" + g_pendingClaimEventKey + "\"}";
     const String topic = String(TOPIC_BASE) + g_deviceId + "/claim";
 
-    logWithDeviceId("[AWS] Publicando claim -> %s\n", payload.c_str());
+    logWithDeviceId("[AWS] Publicando claim -> topic=%s\n", topic.c_str());
 
     const int msgId = esp_mqtt_client_publish(g_mqttClient,
                                               topic.c_str(),
@@ -864,10 +515,47 @@ bool connectAWS()
     {
       logWithDeviceId("[AWS] Mensaje MQTT enviado\n");
       g_claimPending = false;
+      g_pendingClaimEventKey = "";
     }
     else
     {
       logWithDeviceId("[AWS] Mensaje MQTT no enviado\n");
+    }
+  }
+
+  void sendSensorRegistry()
+  {
+    if (!g_sensorRegistryPending || !g_mqttClient || !g_mqttConnected)
+    {
+      return;
+    }
+
+    const String topic = SensorRegistry::buildTopic(g_deviceId);
+    if (g_pendingSensorRegistryEventKey.length() == 0)
+    {
+      g_pendingSensorRegistryEventKey = nextEventKey("sensor_registry");
+    }
+    const String payload = SensorRegistry::buildPayload(g_deviceId, g_pendingSensorRegistryEventKey);
+
+    logWithDeviceId("[AWS] Publicando sensor_registry -> topic=%s bytes=%u\n",
+                    topic.c_str(),
+                    static_cast<unsigned>(payload.length()));
+
+    const int msgId = esp_mqtt_client_publish(g_mqttClient,
+                                              topic.c_str(),
+                                              payload.c_str(),
+                                              static_cast<int>(payload.length()),
+                                              1,
+                                              0);
+    if (msgId >= 0)
+    {
+      logWithDeviceId("[AWS] sensor_registry enviado\n");
+      g_sensorRegistryPending = false;
+      g_pendingSensorRegistryEventKey = "";
+    }
+    else
+    {
+      logWithDeviceId("[AWS] sensor_registry no enviado\n");
     }
   }
 
@@ -887,6 +575,7 @@ bool connectAWS()
     }
 
     sendProvisioningClaim();
+    sendSensorRegistry();
   }
   String formatState(SystemState state)
   {
@@ -944,6 +633,7 @@ bool connectAWS()
       }
 
       String topic = String(TOPIC_BASE) + g_deviceId + "/heartbeat";
+      const String eventKey = nextEventKey("heartbeat");
 
       JsonDocument doc;
       doc["mqtt_topic"] = topic;
@@ -952,6 +642,7 @@ bool connectAWS()
       doc["heap_free"] = esp_get_free_heap_size();
       doc["uptime_ms"] = millis();
       doc["fw"] = FW_VERSION;
+      doc["event_key"] = eventKey;
 
       char buffer[256] = {0};
       const size_t len = serializeJson(doc, buffer, sizeof(buffer));
@@ -977,6 +668,58 @@ bool connectAWS()
       {
           Serial.printf("[HEARTBEAT] Enviado MID=%d -> %s\n", mid, topic.c_str());
       }
+  }
+
+  void sendTelemetry()
+  {
+      if (!g_mqttConnected)
+      {
+          Serial.println("[TELEMETRY] Saltado (MQTT offline)");
+          return;
+      }
+
+      Sht45Sensor::Reading reading;
+      if (!Sht45Sensor::read(reading) || !reading.valid)
+      {
+          Serial.println("[TELEMETRY] Lectura SHT45 fallida");
+          return;
+      }
+
+      const String topic = Sht45Sensor::buildTelemetryTopic(g_deviceId);
+      const String eventKey = nextEventKey("telemetry");
+      const String payload = Sht45Sensor::buildTelemetryPayload(g_deviceId, reading, millis(), eventKey);
+
+      const int mid = esp_mqtt_client_publish(
+          g_mqttClient,
+          topic.c_str(),
+          payload.c_str(),
+          static_cast<int>(payload.length()),
+          1,
+          0);
+
+      if (mid < 0)
+      {
+          Serial.printf("[TELEMETRY] Publicacion fallida en %s\n", topic.c_str());
+      }
+      else
+      {
+          Serial.printf("[TELEMETRY] Enviado MID=%d -> %s\n", mid, topic.c_str());
+      }
+  }
+
+  void logSensorReading()
+  {
+      Sht45Sensor::Reading reading;
+      if (!Sht45Sensor::read(reading) || !reading.valid)
+      {
+          Serial.println("[SHT45] Lectura fallida");
+          return;
+      }
+
+      Serial.printf("[SHT45] T=%.2f C H=%.2f %% VPD=%.2f kPa\n",
+                    reading.temperatureC,
+                    reading.humidityRh,
+                    reading.vpdKpa);
   }
 
   void resetWifiBackoff()
@@ -1139,8 +882,9 @@ bool connectAWS()
     }
 
     const char *userId = g_userId.length() > 0 ? g_userId.c_str() : "(sin user_id)";
-    logWithDeviceId("[IDENTIDAD] MAC: %s\n", g_macAddress.c_str());
-    logWithDeviceId("[IDENTIDAD] user_id: %s\n", userId);
+    logWithDeviceId("[IDENTIDAD] MAC disponible\n");
+    logWithDeviceId("[IDENTIDAD] user_id %s\n",
+                    g_userId.length() > 0 ? "configurado" : "ausente");
     g_identityLogReady = true;
   }
 
@@ -1195,7 +939,6 @@ bool connectAWS()
     {
       g_deviceId = creds.deviceId;
       persistDeviceId();
-      updateDownlinkTopics();
       Provisioning::begin(g_deviceId, onProvisionedCredentials);
     }
 
@@ -1230,7 +973,7 @@ bool connectAWS()
     {
       storeUserId(creds.userId);
       scheduleIdentityLog();
-      logWithDeviceId("[BLE] user_id recibido: %s\n", creds.userId.c_str());
+      logWithDeviceId("[BLE] user_id recibido\n");
     }
 
     g_claimPending = true;
@@ -1322,6 +1065,7 @@ bool connectAWS()
           connectAWS();   // 👈 Se conecta a AWS inmediatamente
         }
         g_claimPending = true;
+        g_sensorRegistryPending = true;
         stopBleSession();
         resetWifiBackoff();
       }
@@ -1473,9 +1217,9 @@ bool connectAWS()
 
     static uint32_t lastLogMs = 0;
     const uint32_t now = millis();
-    if (now - lastLogMs >= 1000)
+    if (now - lastLogMs >= 30000)
     {
-      logWithDeviceId("[WATCHDOG] fed\n");
+      logWithDeviceId("[WATCHDOG] alive\n");
       lastLogMs = now;
     }
   }
@@ -1513,103 +1257,6 @@ bool connectAWS()
 
 } // namespace
 
-String &device_id = g_deviceId;
-
-bool mqttTelemetryReady()
-{
-  return g_mqttClient != nullptr && g_mqttConnected;
-}
-
-bool mqttDiscoveryReady()
-{
-  return mqttTelemetryReady();
-}
-
-bool publishDiscoveryMessage(const char *topic, const char *payload)
-{
-  if (!mqttDiscoveryReady())
-  {
-    return false;
-  }
-  const int msgId = esp_mqtt_client_publish(g_mqttClient,
-                                            topic,
-                                            payload,
-                                            static_cast<int>(strlen(payload)),
-                                            1,
-                                            0);
-  return msgId >= 0;
-}
-
-bool publishTelemetry(float value)
-{
-  if (!mqttTelemetryReady())
-  {
-    Serial.println("[TELEM] omitido (MQTT offline)");
-    return false;
-  }
-
-  JsonDocument doc;
-  doc["device_id"] = g_deviceId;
-  JsonArray readings = doc["readings"].to<JsonArray>();
-  JsonObject entry = readings.add<JsonObject>();
-  const String sensorId = makeSensorId(g_deviceId, "ADC", "A1");
-  entry["sensor_id"] = sensorId;
-  entry["value"] = value;
-
-  char payload[384] = {0};
-  const size_t bytes = serializeJson(doc, payload, sizeof(payload));
-  if (bytes == 0 || bytes >= sizeof(payload))
-  {
-    Serial.println("[TELEM] serialize failed");
-    return false;
-  }
-
-  const String topic = String(TOPIC_BASE) + g_deviceId + "/telemetry";
-  const int msgId = esp_mqtt_client_publish(g_mqttClient,
-                                            topic.c_str(),
-                                            payload,
-                                            static_cast<int>(bytes),
-                                            1,
-                                            0);
-  if (msgId < 0)
-  {
-    Serial.println("[TELEM] publish failed");
-    return false;
-  }
-
-  Serial.println("⛳ SENSOR_ID ENVIADO = " + sensorId);
-  return true;
-}
-
-void handlePpfdTelemetry(float value)
-{
-  const unsigned long now = millis();
-  bool shouldPublish = false;
-  if (!std::isfinite(g_lastPpfdTelemetryValue))
-  {
-    shouldPublish = true;
-  }
-  else if (fabs(value - g_lastPpfdTelemetryValue) >= kPpfdTelemetryDelta)
-  {
-    shouldPublish = true;
-  }
-  else if (now - g_lastPpfdPublishMs >= kPpfdMinPublishIntervalMs)
-  {
-    shouldPublish = true;
-  }
-
-  if (!shouldPublish)
-  {
-    return;
-  }
-
-  if (publishTelemetry(value))
-  {
-    g_lastPpfdTelemetryValue = value;
-    g_lastPpfdPublishMs = now;
-  }
-}
-
 void setup()
 {
   Serial.begin(115200);
@@ -1646,28 +1293,25 @@ void setup()
   scheduleIdentityLog();
   logWithDeviceId("[BOOT] device_id: %s\n", g_deviceId.c_str());
   logWithDeviceId("[BOOT] entorno: %s\n", g_environment.c_str());
-  updateDownlinkTopics();
-  loadSettingsFromPrefs();
-  loadSetpointsFromPrefs();
+  g_bootSessionId = buildBootSessionId();
+  logWithDeviceId("[BOOT] boot_session_id: %s\n", g_bootSessionId.c_str());
 
   Display::begin();
   Display::setConnectionStatus(false);
   Display::setBleActive(false);
   Display::forceRender();
 
+  if (Sht45Sensor::begin())
+  {
+    Serial.println("[SHT45] Sensor inicializado");
+  }
+  else
+  {
+    Serial.println("[SHT45] No se encontro SHT45");
+  }
+
   Provisioning::begin(g_deviceId, onProvisionedCredentials);
 
-  PpfdAnalogMonitor::Calibration ppfdCalibration;
-  ppfdCalibration.r1Ohms = 3569.0f;
-  ppfdCalibration.r2Ohms = 1100.0f;
-  ppfdCalibration.sensorVoltageMax = 5.0f;
-  ppfdCalibration.ppfdFullScale = 2500.0f;
-  ppfdCalibration.calibrationFactor = 1.0f;
-  ppfdCalibration.samplesPerReading = 10;
-  PpfdAnalogMonitor::setCalibration(ppfdCalibration);
-  PpfdAnalogMonitor::setTelemetryCallback(handlePpfdTelemetry);
-  PpfdAnalogMonitor::begin();
-  SensorDiscovery::begin(g_deviceId, publishDiscoveryMessage, mqttDiscoveryReady);
 
   configureButton();
   setupWatchdogs();
@@ -1693,6 +1337,14 @@ void loop()
     sendHeartbeat();
     lastHeartbeatMs = now;
   }
+  if (now - lastTelemetryMs >= TELEMETRY_INTERVAL) {
+    sendTelemetry();
+    lastTelemetryMs = now;
+  }
+  if (now - lastSensorLogMs >= SENSOR_LOG_INTERVAL) {
+    logSensorReading();
+    lastSensorLogMs = now;
+  }
   handleBleButton();
   handleBleTimeout();
   handleWifiStatus();
@@ -1706,9 +1358,8 @@ void loop()
 
   Provisioning::loop();
   Display::loop();
-  SensorDiscovery::loop();
-  PpfdAnalogMonitor::loop();
 
   delay(1);
 }
+
 

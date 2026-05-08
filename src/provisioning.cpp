@@ -161,7 +161,7 @@ namespace Provisioning
 
     bool isValidLength(const String &value, size_t maxLen)
     {
-      return value.length() <= maxLen;
+      return value.length() < maxLen;
     }
 
     ParsedCredentials parseCredentials(const std::string &raw)
@@ -279,21 +279,63 @@ namespace Provisioning
         return result;
       }
 
-      if (!isValidLength(result.ssid, 128))
+      if (!isValidLength(result.ssid, kMaxSsidLength))
       {
         result.error = "ssid_len";
         return result;
       }
 
-      if (!isValidLength(result.password, 128))
+      if (!isValidLength(result.password, kMaxPasswordLength))
       {
         result.error = "password_len";
+        return result;
+      }
+
+      if (!isValidLength(result.userId, kMaxUserIdLength))
+      {
+        result.error = "user_id_len";
         return result;
       }
 
       if (!isValidDeviceId(result.deviceId))
       {
         result.error = "device_id";
+        return result;
+      }
+
+      if (!isValidLength(result.deviceId, kMaxDeviceIdLength))
+      {
+        result.error = "device_id_len";
+        return result;
+      }
+
+      if (!isValidLength(result.endpoint, kMaxEndpointLength))
+      {
+        result.error = "endpoint_len";
+        return result;
+      }
+
+      if (!isValidLength(result.region, kMaxRegionLength))
+      {
+        result.error = "region_len";
+        return result;
+      }
+
+      if (!isValidLength(result.environment, kMaxEnvLength))
+      {
+        result.error = "environment_len";
+        return result;
+      }
+
+      if (!isValidLength(result.thingName, kMaxThingNameLength))
+      {
+        result.error = "thing_name_len";
+        return result;
+      }
+
+      if (!isValidLength(result.provisionToken, kMaxProvisionTokenLength))
+      {
+        result.error = "token_len";
         return result;
       }
 
@@ -367,6 +409,7 @@ namespace Provisioning
         snprintf(payload.region, sizeof(payload.region), "%s", credentials.region.c_str());
         snprintf(payload.environment, sizeof(payload.environment), "%s", credentials.environment.c_str());
         snprintf(payload.thingName, sizeof(payload.thingName), "%s", credentials.thingName.c_str());
+        snprintf(payload.provisionToken, sizeof(payload.provisionToken), "%s", credentials.provisionToken.c_str());
         payload.awsPort = credentials.awsPort;
         queueCredentials(payload);
       }

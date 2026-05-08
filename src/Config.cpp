@@ -32,9 +32,9 @@ namespace Config
         {"device", "env", 64},
         {"aws", "endpoint", 256},
         {"aws", "thing", 128},
-        {"certs", "root_ca_path", 256},
-        {"certs", "device_cert_path", 256},
-        {"certs", "private_key_path", 256},
+        {"certs", "root_ca", 256},
+        {"certs", "device_cert", 256},
+        {"certs", "private_key", 256},
     };
 
     bool hasLogged(const char *ns, const char *key)

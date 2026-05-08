@@ -1,60 +1,112 @@
-# Firmware ESP32 - Integracion BLE + AWS IoT
+# Firmware ESP32 Base - BLE + Wi-Fi + AWS IoT
 
 ## Panorama general
-Firmware para ESP32-C3 (board `adafruit_qtpy_esp32c3`) que gestiona la provision BLE, la conexion Wi-Fi y la comunicacion MQTT segura con AWS IoT Core. El dispositivo se integra con:
-- Lambda como router de mensajes hacia Supabase.
-- Supabase para persistencia, reglas RLS y vistas analiticas.
-- App Flutter que refleja estados en tiempo real mediante topics MQTT.
+Firmware base para `ESP32-C3` (`adafruit_qtpy_esp32c3`) orientado a reutilizarse en otros proyectos. Mantiene aprovisionamiento BLE, conexion Wi-Fi, OLED, almacenamiento local en NVS/SPIFFS y conectividad MQTT segura con AWS IoT Core.
 
-## Arquitectura de punta a punta
-- **Dispositivo**: ESP32-C3 con BLE de aprovisionamiento, interfaz OLED y conectividad Wi-Fi.
-- **AWS IoT Core**: Endpoint `a7xxu98k219gv-ats.iot.us-east-1.amazonaws.com` con autenticacion mutua (Root CA + certificado + llave privada).
-- **AWS Lambda**: Normaliza y enruta mensajes entrantes desde `devices/<device_id>/claim` hacia Supabase.
-- **Supabase**: Guarda claims y estados del dispositivo, expone vistas protegidas por RLS para la app.
-- **App Flutter**: Gestiona onboarding del usuario, alimenta credenciales al dispositivo via BLE y presenta estados en vivo.
+## Alcance actual
+- Provisioning BLE con payload de credenciales y metadatos del dispositivo.
+- Conexion Wi-Fi con reconexion automatica.
+- OLED como indicador local de estado.
+- Persistencia de `device_id`, `user_id`, Wi-Fi y parametros AWS.
+- Cliente MQTT TLS con certificados en SPIFFS.
+- Publicacion base de `claim` y `heartbeat`.
+- `device_kind` enviado en el `claim` MQTT con valor default definido en firmware.
+- Publicacion de `sensor_registry` con metadata del sensor ambient.
+- Publicacion de `telemetry` con lecturas reales del SHT45 y VPD calculado.
+
+## Lo que ya no incluye
+- Lecturas PPFD o cualquier sensor especifico.
+- Discovery de sensores.
+- Downlinks de `settings` o `setpoints`.
+- Persistencia de configuraciones de negocio.
+
+## Arquitectura
+- **Dispositivo**: ESP32-C3 con BLE, Wi-Fi y OLED.
+- **AWS IoT Core**: broker MQTT TLS con certificados X.509.
+- **Supabase**: auth y base de datos desde app/backend.
+- **App Flutter**: login, onboarding y envio de credenciales por BLE.
 
 ## Flujo operativo
-1. **Boot y SPIFFS**: Monta SPIFFS y, en caso de error, intenta formatear y volver a montar. Emite logs por Serial.
-2. **Identidad**: Calcula `device_id` (prefijo `OLEO_` + sufijo de MAC), lo guarda en NVS y agenda log diferido con `user_id` y direccion MAC.
-3. **Display**: Inicializa U8g2 sobre I2C con un icono circular que refleja conectividad (relleno, contorno o parpadeo).
-4. **Provisioning BLE**: Servicio y caracteristica personalizadas aceptan payload `SSID|password|user_id` o con saltos de linea. La cola FreeRTOS desacopla callbacks y evita trabajo pesado en interrupciones.
-5. **Boton fisico**: GPIO0 con interrupcion (debounce + presion prolongada de 3 s) que borra credenciales Wi-Fi y activa sesion BLE de 60 s.
-6. **Conexion Wi-Fi**: Se conecta con credenciales existentes o espera nuevas via BLE. Publica estados a la app (`wifi:conectando`, `wifi:conectado`, `wifi:error`).
-7. **AWS IoT Core**: Tras asociarse a la red Wi-Fi, carga certificados desde SPIFFS y establece cliente MQTT TLS (buffer 1 KB, reintento cada 5 s). Publica claim JSON en `devices/<device_id>/claim`.
-8. **Loop principal**: Procesa boton, expiracion BLE, estado Wi-Fi, reconexiones AWS, cola de eventos y refresco OLED con `delay(1)` para ceder CPU.
+1. Monta `SPIFFS` y carga configuracion local.
+2. Genera o recupera `device_id` desde NVS.
+3. Inicia OLED y BLE provisioning.
+4. Recibe `ssid`, `password`, `user_id` y parametros AWS por BLE.
+5. Conecta a Wi-Fi y arranca MQTT sobre AWS IoT Core.
+6. Publica `claim` al asociar el dispositivo y `heartbeat` periodico cuando MQTT esta activo.
+7. Permite reprovisioning con boton fisico y muestra estado local en OLED.
 
-## Componentes clave del firmware
-- **src/main.cpp**: Orquesta estados globales, manejo de Wi-Fi/BLE/AWS, logs con prefijo `device_id` y scheduler de identidad.
-- **src/provisioning.cpp / provisioning.h**: Encapsula BLE GATT, parseo defensivo de credenciales (trim, limites de longitud) y notificaciones reactivas.
-- **src/oled_display.cpp / oled_display.h**: Abstraccion para U8g2, gestiona parpadeo cuando BLE esta activo.
-- **data/certs/**: Certificados PEM que se cargan en SPIFFS (`AmazonRootCA1.pem`, `device.pem.crt`, `private.pem.key`).
-- **platformio.ini**: Define entorno `adafruit_qtpy_esp32c3`, monitor serie 9600, particiones `huge_app.csv` y dependencias (PubSubClient, U8g2, ArduinoJson).
+## Topics base
+- `lab/devices/<device_id>/claim`
+- `lab/devices/<device_id>/heartbeat`
+- `lab/devices/<device_id>/sensor_registry`
+- `lab/devices/<device_id>/telemetry`
 
-## Configuracion y despliegue
-- Copiar certificados actualizados a `data/certs` y ejecutar `pio run --target uploadfs` para montarlos en SPIFFS.
-- Ajustar `AWS_IOT_ENDPOINT`, topics y puertos segun ambiente (dev, staging, prod) antes del build.
-- Programar el binario con `pio run --target upload` y validar logs en el monitor serie (9600 bps).
-- Verificar que la app Flutter detecte el anuncio BLE (nombre `device_id`) y pueda enviar credenciales.
+## Payload base de claim
+```json
+{
+  "device_id": "lab_XXXXXX",
+  "user_id": "uuid-del-usuario",
+  "device_kind": "climate_sensor"
+}
+```
 
-## Observabilidad y soporte
-- Logs serializados mediante `logWithDeviceId` para facilitar trazabilidad multi-dispositivo.
-- Notificaciones BLE oportunas para la app durante provisioning y fallas.
-- OLED como indicador local para personal de campo sin necesidad de consola.
+## Payload base de sensor registry
+```json
+{
+  "device_id": "lab_XXXXXX",
+  "sensor_key": "ambient_1",
+  "sensor_type": "sht45",
+  "vendor": "adafruit",
+  "model": "SHT45",
+  "measures": ["temperature_c", "humidity_rh", "vpd_kpa"],
+  "unit_map": {
+    "temperature_c": "C",
+    "humidity_rh": "%",
+    "vpd_kpa": "kPa"
+  },
+  "i2c_address": "0x44",
+  "bus": "i2c0",
+  "position": "canopy",
+  "is_active": true,
+  "metadata": {
+    "source": "firmware"
+  }
+}
+```
 
-## Puntos de mejora para produccion comercial
-- **Seguridad de certificados**: SPIFFS sin cifrado; evaluar NVS cifrado, secure element o PKCS#11 con rotacion remota.
-- **Resiliencia MQTT**: Agregar backoff exponencial real, watchdog de reconexion, QoS1/QoS2 segun SLA y suscripciones de control (comandos remotos).
-- **Provisionamiento seguro**: Evaluar emparejamiento BLE o token de un solo uso para evitar aprovisionamientos no autorizados.
-- **Gestion Wi-Fi avanzada**: Escaneo activo, memoria de redes priorizadas, reintentos graduados y actualizacion remota de credenciales desde backend.
-- **Telemetria ampliada**: Enviar eventos de estado, metricas de uptime y errores a topics secundarios para monitoreo.
-- **Estrategia OTA**: Integrar actualizaciones via AWS IoT Jobs u otra solucion robusta con rollback.
-- **UX de campo**: Mensajes textuales breves en la OLED ante fallas y modo ahorro de energia cuando no hay actividad.
-- **Testing automatizado**: Crear pruebas unitarias para parsing de credenciales, colas BLE y reconexion MQTT; considerar CI con simulaciones de Wi-Fi.
-- **Configuracion parametrica**: Externalizar constantes (endpoints, topics, timers) en archivo de configuracion o particion NVS editable.
+## Payload base de telemetry
+```json
+{
+  "device_id": "lab_XXXXXX",
+  "sensor_key": "ambient_1",
+  "temperature_c": 25.4,
+  "humidity_rh": 68.2,
+  "vpd_kpa": 1.03,
+  "uptime_ms": 123456
+}
+```
 
-## Checklist sugerido antes de liberar
-- Claim recibido en Lambda y reflejado en Supabase con `user_id` correcto.
-- BLE se desactiva tras 60 s o al conectar Wi-Fi, sin fugas de memoria.
-- MQTT se reconecta tras perdida de Wi-Fi en menos de 30 s.
-- OLED refleja estados correctos durante provisioning y fallas inducidas.
-- Pruebas de presion larga del boton con rebotes controlados en hardware objetivo.
+## Archivos clave
+- `src/main.cpp`: orquestacion general, Wi-Fi, BLE, AWS y watchdogs.
+- `src/sensor_registry.cpp`: construccion del payload JSON para registrar sensores.
+- `src/sht45_sensor.cpp`: lectura real del SHT45, calculo de VPD y payload de telemetria.
+- `src/provisioning.cpp`: servicio BLE GATT y parseo de credenciales.
+- `src/oled_display.cpp`: estado visual local.
+- `src/Config.cpp`: wrapper de NVS.
+- `platformio.ini`: board, puertos, SPIFFS y flags de compilacion.
+
+## Certificados y despliegue
+- Coloca en `data/certs/`:
+  - `AmazonRootCA1.pem`
+  - `device.pem.crt`
+  - `private.pem.key`
+- Sube SPIFFS con `pio run --target uploadfs`.
+- Flashea firmware con `pio run --target upload`.
+- Monitorea serial con `pio device monitor`.
+
+## Siguientes extensiones
+Este repositorio queda listo para agregar modulos de negocio encima de la base, por ejemplo:
+- telemetria de sensores
+- comandos remotos por MQTT
+- integracion backend adicional
+- OTA
